@@ -1,0 +1,13 @@
+[package]
+name = "adaptive-ji"
+version = "0.1.0"
+edition = "2024"
+description = "Linux MIDI processor for dynamic five-limit just intonation"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
+env_logger = "0.11"
+log = "0.4"
+midir = "0.11"
