@@ -164,6 +164,30 @@ mod tests {
         MpeProcessor::new(FiveLimitLowestRoot, "2".parse().unwrap())
     }
 
+    #[test]
+    fn adaptive_seventh_and_reference_change_update_bends_without_retrigger() {
+        let mut processor = MpeProcessor::new(
+            crate::tuning::AdaptiveRationalOptimizer::default(),
+            "2".parse().unwrap(),
+        );
+        for note in [60, 64, 67] {
+            processor.process(on(note));
+        }
+        let added = processor.process(on(70));
+        assert_eq!(added.iter().filter(|msg| msg[0] & 0xf0 == 0x90).count(), 1);
+        let seventh = 1200.0 * (7.0_f64 / 4.0).log2() - 1000.0;
+        assert!(added.contains(&encode_pitch_bend(4, cents_to_pitch_bend(seventh, 2.0))));
+        let removed = processor.process(off(60));
+        assert!(!removed.iter().any(|msg| msg[0] & 0xf0 == 0x90));
+        assert_eq!(
+            removed.iter().filter(|msg| msg[0] & 0xf0 == 0xe0).count(),
+            4
+        );
+        assert!(removed.contains(&encode_pitch_bend(2, CENTER)));
+        assert_eq!(processor.voices()[0].input_note, 64);
+        assert_eq!(processor.voices()[0].cents_offset, 0.0);
+    }
+
     fn on(note: u8) -> MidiEvent {
         MidiEvent::NoteOn {
             channel: 0,

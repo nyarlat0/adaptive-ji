@@ -34,10 +34,8 @@ impl TuningStrategy for FiveLimitLowestRoot {
                     numerator /= 2;
                     denominator /= 2;
                 }
-                let ratio = Ratio {
-                    numerator,
-                    denominator,
-                };
+                let ratio = Ratio::new(u64::from(numerator), u64::from(denominator))
+                    .expect("positive five-limit interval");
                 let ji_cents = 1200.0 * (f64::from(numerator) / f64::from(denominator)).log2();
                 TunedNote {
                     id: note.id,

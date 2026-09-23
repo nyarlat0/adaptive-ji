@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use midir::os::unix::VirtualOutput;
 use midir::{Ignore, MidiInput, MidiOutput, MidiOutputConnection};
 
-use crate::{mpe::MpeProcessor, pitch_bend::BendRange, tuning::FiveLimitLowestRoot};
+use crate::{mpe::MpeProcessor, pitch_bend::BendRange, tuning::TuningStrategy};
 
 pub const OUTPUT_PORT_NAME: &str = "Adaptive JI Out";
 
@@ -146,10 +146,10 @@ fn virtual_output() -> Result<MidiOutputConnection> {
 
 #[cfg(not(target_os = "linux"))]
 fn virtual_output() -> Result<MidiOutputConnection> {
-    bail!("adaptive-ji v0.1 supports Linux/ALSA only")
+    bail!("adaptive-ji supports Linux/ALSA only")
 }
 
-pub fn run(selector: &str, range: BendRange) -> Result<()> {
+pub fn run<T: TuningStrategy>(selector: &str, range: BendRange, tuning: T) -> Result<()> {
     let mut input = input_client()?;
     input.ignore(Ignore::None);
     let ports = input.ports();
@@ -160,7 +160,7 @@ pub fn run(selector: &str, range: BendRange) -> Result<()> {
         .context("Cannot read MIDI input port names")?;
     let index = select_input(&names, selector)?;
     let mut output = virtual_output()?;
-    let mut processor = MpeProcessor::new(FiveLimitLowestRoot, range);
+    let mut processor = MpeProcessor::new(tuning, range);
 
     let stopping = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&stopping);

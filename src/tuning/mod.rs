@@ -1,6 +1,12 @@
+pub mod adaptive;
+pub mod candidates;
 mod five_limit;
+pub mod rational;
+pub mod roughness;
 
+pub use adaptive::{AdaptiveRationalOptimizer, OptimizerConfig, ScoreWeights};
 pub use five_limit::FiveLimitLowestRoot;
+pub use rational::Ratio;
 
 pub type VoiceId = u64;
 
@@ -10,19 +16,7 @@ pub struct ActiveNote {
     pub input_note: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ratio {
-    pub numerator: u32,
-    pub denominator: u32,
-}
-
-impl std::fmt::Display for Ratio {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.numerator, self.denominator)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TunedNote {
     pub id: VoiceId,
     pub ratio: Ratio,
@@ -32,4 +26,10 @@ pub struct TunedNote {
 /// Return one tuning per voice ID, including repeated instances of the same key.
 pub trait TuningStrategy {
     fn tune(&mut self, active_notes: &[ActiveNote]) -> Vec<TunedNote>;
+}
+
+impl<T: TuningStrategy + ?Sized> TuningStrategy for Box<T> {
+    fn tune(&mut self, active_notes: &[ActiveNote]) -> Vec<TunedNote> {
+        (**self).tune(active_notes)
+    }
 }

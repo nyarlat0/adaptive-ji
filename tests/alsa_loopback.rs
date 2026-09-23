@@ -41,7 +41,17 @@ fn receive_through(receiver: &Receiver<Vec<u8>>, last: [u8; 3]) -> Vec<Vec<u8>> 
 #[test]
 #[ignore = "requires /dev/snd/seq; run cargo test --test alsa_loopback -- --ignored"]
 fn actual_binary_routes_retunes_and_cleans_up_on_sigint() {
-    let source_name = format!("adaptive-ji test keyboard {}", std::process::id());
+    // Sequential runs keep the existing baseline regression and exercise the new default.
+    run_strategy("five-limit");
+    run_strategy("adaptive");
+    run_strategy("adaptive-zero");
+}
+
+fn run_strategy(strategy: &str) {
+    let source_name = format!(
+        "adaptive-ji test keyboard {strategy} {}",
+        std::process::id()
+    );
     let mut keyboard = MidiOutput::new(&source_name)
         .unwrap()
         .create_virtual(&source_name)
@@ -56,6 +66,12 @@ fn actual_binary_routes_retunes_and_cleans_up_on_sigint() {
     let mut app = RunningApp(
         Command::new(env!("CARGO_BIN_EXE_adaptive-ji"))
             .args(["--input", &source_name, "--bend-range", "2"])
+            // Omit the flag for adaptive to check the CLI default as well.
+            .args(match strategy {
+                "five-limit" => vec!["--strategy", "five-limit"],
+                "adaptive-zero" => vec!["--w-roughness", "0"],
+                _ => vec![],
+            })
             .spawn()
             .unwrap(),
     );
@@ -113,9 +129,33 @@ fn actual_binary_routes_retunes_and_cleans_up_on_sigint() {
     let g = receive_through(&receiver, [0x93, 67, 100]);
     assert!(g.contains(&encode_pitch_bend(3, 8272).to_vec()));
 
-    // Releasing C makes E the root while E/G remain held.
+    if strategy != "five-limit" {
+        keyboard.send(&[0x90, 70, 100]).unwrap();
+        let seventh = receive_through(&receiver, [0x94, 70, 100]);
+        let cents = 1200.0 * (7.0_f64 / 4.0).log2() - 1000.0;
+        assert!(seventh.contains(&encode_pitch_bend(4, cents_to_pitch_bend(cents, 2.0)).to_vec()));
+        assert_eq!(
+            seventh
+                .iter()
+                .filter(|message| message[0] & 0xf0 == 0x90)
+                .count(),
+            1
+        );
+        keyboard.send(&[0x80, 70, 0]).unwrap();
+        let released = receive_through(&receiver, encode_pitch_bend(3, 8272));
+        assert_eq!(released[0], [0x84, 70, 0]);
+        assert!(!released.iter().any(|message| message[0] & 0xf0 == 0x90));
+    }
+
+    // E becomes the new reference (adaptive) or root (five-limit). Adaptive
+    // movement cost prefers 32/27 here, reducing the jump of the already held G.
     keyboard.send(&[0x80, 60, 45]).unwrap();
-    let g_relative_to_e = 1200.0 * (6.0_f64 / 5.0).log2() - 300.0;
+    let ratio: f64 = if strategy != "five-limit" {
+        32.0 / 27.0
+    } else {
+        6.0 / 5.0
+    };
+    let g_relative_to_e = 1200.0 * ratio.log2() - 300.0;
     let retuned = receive_through(
         &receiver,
         encode_pitch_bend(3, cents_to_pitch_bend(g_relative_to_e, 2.0)),
