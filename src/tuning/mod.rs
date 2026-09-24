@@ -1,6 +1,7 @@
 pub mod adaptive;
 pub mod candidates;
 mod five_limit;
+pub mod profile;
 pub mod rational;
 pub mod roughness;
 

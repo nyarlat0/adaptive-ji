@@ -1,8 +1,8 @@
-# adaptive-ji 0.6
+# adaptive-ji 0.7
 
 CLI-программа для Linux: принимает обычный MIDI 1.0 через `midir`/ALSA,
 подбирает контекстный 7-limit just intonation для всего аккорда с учётом
-приближённой roughness между гармониками нот и выдаёт
+приближённой roughness между partials выбранного спектра и выдаёт
 MPE-подобный поток через виртуальный ALSA MIDI-порт **Adaptive JI Out**.
 GUI, аудиодвижка, JACK API и плагинов в программе нет.
 
@@ -57,6 +57,8 @@ adaptive score. `-vv` дополнительно показывает debug-со
 adaptive-ji --input "KeyRig" --strategy adaptive -v
 adaptive-ji --input "KeyRig" --strategy adaptive --anchor-mode fixed -v
 adaptive-ji --input "KeyRig" --strategy five-limit -v
+adaptive-ji --input "KeyRig" --spectrum bright -v
+adaptive-ji --input "KeyRig" --spectrum-file spectrum.toml -v
 ```
 
 Настройки optimizer (показаны defaults):
@@ -74,6 +76,14 @@ adaptive-ji --input "KeyRig" --strategy adaptive \
 `--anchor-mode` принимает `floating` (default) или `fixed`; `--anchor-max`
 принимает 0..100 cents, default 35. Он ограничивает общий абсолютный сдвиг строя.
 `--roughness-partials` — 1..64; `--roughness-rolloff` — 0.1..4.0.
+`--spectrum` выбирает `harmonic` (default), `sine`, `saw`, `square`, `soft`
+или `bright`. Для built-in `--roughness-partials` задаёт максимальный номер
+гармоники (для sine всегда один partial); `--roughness-rolloff` меняет показатель
+спада: harmonic/saw/square ×1, soft ×2, bright ×0.5. При default rolloff=1
+это соответственно `1/n`, `1/n²` и `1/√n`; square оставляет только нечётные `n`.
+`--spectrum-file PATH` загружает статический custom TOML и имеет приоритет над
+`--spectrum`: оба generator-параметра при этом игнорируются. Максимум 128
+partials, превышение выдаёт ошибку без усечения.
 Нулевые K/beam и NaN/бесконечности отклоняются до открытия MIDI-порта.
 Более широкий beam и больше candidates увеличивают время пересчёта.
 `--anchor-mode fixed` воспроизводит привязку reference к 0 cents из v0.3.
@@ -283,13 +293,14 @@ optimizer v0.2 предпочитает G/E=32/27: G перемещается п
 
 ```text
 f0 = 440 * 2^((midi_note - 69 + offset_cents/100)/12)
-f_n = n * f0
-a_n_raw = 1 / n^rolloff
-a_n = a_n_raw / sqrt(sum(a_k_raw^2))
+f_i = frequency_ratio_i * f0
+a_i = amplitude_i / sqrt(sum(amplitude_k^2))
 ```
 
 Амплитуды имеют суммарную энергию 1 при любом количестве partials; дополнительного
-скрытого множителя нет. Для каждой пары partials **разных** нот:
+скрытого множителя нет. Для harmonic-default `frequency_ratio=n` и
+`a_raw=1/n^rolloff`; custom profile разрешает дробные отношения вроде `4.03`.
+Для каждой пары partials **разных** нот:
 
 ```text
 f_min = min(f1, f2)
@@ -302,15 +313,46 @@ R(noteA, noteB) = sum(r_pair over cross-note partial pairs)
 
 Мелкие отрицательные ошибки округления обрезаются до 0. Это приближённая
 Sethares/Plomp–Levelt-style метрика сенсорной диссонантности синтетического
-гармонического спектра, не физически точная модель конкретного патча Surge XT.
-FFT, анализ аудио, inharmonicity фортепиано, распознавание аккордов и тональности
+спектра, не физически точная модель конкретного патча Surge XT.
+Roughness **не является свойством одного ratio**: она зависит от partials тембра.
+Например, `roughness_scan -- 60 67` даёт для sine `3/2 ≈ 0.010414`,
+`32/21 ≈ 0.008465`, а для bright — `3/2 ≈ 0.047109`, `32/21 ≈ 0.087249`.
+Это разные ranking при одной паре MIDI-нот; с большим `--w-roughness`
+optimizer может выбрать разный строй. Sine не получает преимуществ от
+совпадающих верхних гармоник, потому что их нет. FFT, анализ аудио,
+автоматическое определение патча, распознавание аккордов и тональности
 не используются.
+
+Custom TOML (один статический профиль на запуск):
+
+```toml
+[[partial]]
+ratio = 1.0
+amplitude = 1.0
+
+[[partial]]
+ratio = 2.001
+amplitude = 0.52
+
+[[partial]]
+ratio = 4.03
+amplitude = 0.18
+```
+
+`ratio` должен быть конечным и >0, `amplitude` — конечной и ≥0; нулевые
+amplitudes удаляются, остальные нормируются до суммарной энергии 1.
+Нужен хотя бы один ненулевой partial. Никакого hot reload или спектра по
+отдельным нотам/velocity пока нет. `-v` показывает имя профиля и число partials
+один раз при запуске.
 
 Для просмотра кандидатов без MIDI:
 
 ```bash
 cargo run --release --example roughness_scan -- 60 67
-cargo run --release --example roughness_scan -- 64 67
+cargo run --release --example roughness_scan -- 60 67 --spectrum sine
+cargo run --release --example roughness_scan -- 60 67 --spectrum bright
+cargo run --release --example spectrum_dump -- bright
+cargo run --release --example spectrum_dump -- --spectrum-file spectrum.toml
 ```
 
 Выводятся ratio, cents, **base offset**, harmonic complexity и roughness относительно
@@ -417,12 +459,14 @@ src/
     rational.rs          reduced Ratio, checked arithmetic, complexity
     candidates.rs        7-limit lattice, pruning и кэш по интервалам
     adaptive.rs          config, Costs, floating anchor, история voices, beam search
-    roughness.rs         гармонические partials и pairwise sensory roughness
+    profile.rs           нормированные built-in/custom spectral profiles
+    roughness.rs         абсолютные spectra и pairwise sensory roughness
     five_limit.rs        FiveLimitLowestRoot
 examples/
   retune_benchmark.rs     диагностика времени пересчёта 15 voices
   glide_benchmark.rs      CPU-диагностика glide 15 voices без sleep/ALSA
   roughness_scan.rs       сравнение roughness кандидатов для двух MIDI notes
+  spectrum_dump.rs        нормированные partials выбранного профиля
 ```
 
 Следующий алгоритм реализует `TuningStrategy::tune(&mut self, &[ActiveNote]) ->
@@ -468,14 +512,14 @@ cargo run --release --example retune_benchmark -- 100
 cargo run --release --example glide_benchmark -- 10000
 ```
 
-Без жёстких timing assertions. Пример на AMD Ryzen 9 5900X, release,
-K=8/beam=2048, `w_roughness=20`, 30 повторов плотного 15-голосного набора:
+Без жёстких timing assertions. `retune_benchmark` измеряет 15 голосов при
+sine, harmonic-default, bright и custom 32-partial профиле. Стоимость
+попарной roughness примерно растёт как `partials_A × partials_B`; большой
+custom-профиль ожидаемо дороже.
 
-| Сценарий | Fixed среднее | Floating среднее |
-| --- | ---: | ---: |
-| Свежий аккорд | 11.990 мс | 12.216 мс |
-| Удерживаемые 15 voices | 11.612 мс | 12.194 мс |
-| Добавление/отпускание 15-го voice | 11.063 мс | 11.657 мс |
+Пример одного release-прогона (5 повторов, среднее для свежего аккорда):
+sine ≈ 6.7 мс, harmonic ≈ 12.1 мс, bright ≈ 12.0 мс,
+custom 32-partial ≈ 45.2 мс.
 
 Измеряется только `tune()`, без создания optimizer, MIDI I/O и логирования.
 Это ориентир конкретного запуска, а не гарантия задержки; параметры поиска,

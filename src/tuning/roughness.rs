@@ -1,5 +1,7 @@
-//! Approximate sensory dissonance between synthetic harmonic spectra.
+//! Approximate sensory dissonance between synthetic spectra.
 //! This is a Sethares/Plomp-Levelt-style metric, not a model of a real patch or ear.
+
+use super::profile::{SpectrumPreset, SpectrumProfile};
 
 #[derive(Clone, Copy, Debug)]
 pub struct RoughnessConfig {
@@ -45,46 +47,43 @@ impl Spectrum {
     }
 }
 
-/// Precomputes amplitude shape once per optimizer/scan, then applies it to each fundamental.
+/// Applies one immutable, unit-energy profile to every candidate fundamental.
 pub struct SpectrumModel {
-    amplitudes: Vec<f64>,
+    profile: SpectrumProfile,
 }
 
 impl SpectrumModel {
     pub fn new(config: RoughnessConfig) -> Result<Self, String> {
-        config.validate()?;
-        let mut amplitudes: Vec<_> = (1..=config.partials)
-            .map(|n| 1.0 / (n as f64).powf(config.rolloff))
-            .collect();
-        let norm = amplitudes
-            .iter()
-            .map(|amplitude| amplitude * amplitude)
-            .sum::<f64>()
-            .sqrt();
-        for amplitude in &mut amplitudes {
-            *amplitude /= norm;
-        }
-        Ok(Self { amplitudes })
+        Ok(Self::from_profile(SpectrumProfile::builtin(
+            SpectrumPreset::Harmonic,
+            config,
+        )?))
+    }
+
+    pub fn from_profile(profile: SpectrumProfile) -> Self {
+        Self { profile }
+    }
+
+    pub fn profile(&self) -> &SpectrumProfile {
+        &self.profile
     }
 
     pub fn spectrum(&self, fundamental_hz: f64) -> Result<Spectrum, String> {
-        if !fundamental_hz.is_finite()
-            || fundamental_hz <= 0.0
-            || fundamental_hz * self.amplitudes.len() as f64 > f64::MAX
-        {
-            return Err("fundamental frequency must be finite, positive and representable".into());
+        if !fundamental_hz.is_finite() || fundamental_hz <= 0.0 {
+            return Err("fundamental frequency must be finite and positive".into());
         }
-        Ok(Spectrum {
-            partials: self
-                .amplitudes
-                .iter()
-                .enumerate()
-                .map(|(index, &amplitude)| Partial {
-                    frequency_hz: fundamental_hz * (index + 1) as f64,
-                    amplitude,
-                })
-                .collect(),
-        })
+        let mut partials = Vec::with_capacity(self.profile.partials().len());
+        for partial in self.profile.partials() {
+            let frequency_hz = fundamental_hz * partial.frequency_ratio;
+            if !frequency_hz.is_finite() || frequency_hz <= 0.0 {
+                return Err("profile frequency is not representable for this fundamental".into());
+            }
+            partials.push(Partial {
+                frequency_hz,
+                amplitude: partial.amplitude,
+            });
+        }
+        Ok(Spectrum { partials })
     }
 }
 
@@ -112,6 +111,7 @@ pub fn roughness(a: &Spectrum, b: &Spectrum) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tuning::profile::{ProfilePartial, SpectrumPreset, SpectrumProfile};
 
     fn default_model() -> SpectrumModel {
         SpectrumModel::new(RoughnessConfig::default()).unwrap()
@@ -214,5 +214,77 @@ mod tests {
         assert!(model.spectrum(f64::INFINITY).is_err());
         assert!((fundamental_frequency(69, 0.0) - 440.0).abs() < 1e-12);
         assert!((fundamental_frequency(60, 0.0) - 261.625565).abs() < 1e-6);
+    }
+
+    #[test]
+    fn harmonic_default_regresses_v06_values_and_sine_changes_roughness() {
+        let harmonic = default_model();
+        let sine = SpectrumModel::from_profile(
+            SpectrumProfile::builtin(SpectrumPreset::Sine, RoughnessConfig::default()).unwrap(),
+        );
+        let f = fundamental_frequency(64, 0.0);
+        let harmonic_six_five = roughness(
+            &harmonic.spectrum(f).unwrap(),
+            &harmonic.spectrum(f * 6.0 / 5.0).unwrap(),
+        );
+        let harmonic_32_27 = roughness(
+            &harmonic.spectrum(f).unwrap(),
+            &harmonic.spectrum(f * 32.0 / 27.0).unwrap(),
+        );
+        assert!((harmonic_six_five - 0.082175).abs() < 1e-5);
+        assert!((harmonic_32_27 - 0.093253).abs() < 1e-5);
+        let sine_six_five = roughness(
+            &sine.spectrum(f).unwrap(),
+            &sine.spectrum(f * 6.0 / 5.0).unwrap(),
+        );
+        assert!((sine_six_five - harmonic_six_five).abs() > 0.001);
+        assert!(
+            (sine_six_five
+                - roughness(
+                    &sine.spectrum(f * 6.0 / 5.0).unwrap(),
+                    &sine.spectrum(f).unwrap()
+                ))
+            .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn profile_changes_candidate_ranking_without_special_case_rules() {
+        let f = fundamental_frequency(60, 0.0);
+        let config = RoughnessConfig::default();
+        let sine = SpectrumModel::from_profile(
+            SpectrumProfile::builtin(SpectrumPreset::Sine, config).unwrap(),
+        );
+        let bright = SpectrumModel::from_profile(
+            SpectrumProfile::builtin(SpectrumPreset::Bright, config).unwrap(),
+        );
+        let pair = |model: &SpectrumModel, ratio: f64| {
+            roughness(
+                &model.spectrum(f).unwrap(),
+                &model.spectrum(f * ratio).unwrap(),
+            )
+        };
+        assert!(pair(&sine, 32.0 / 21.0) < pair(&sine, 3.0 / 2.0));
+        assert!(pair(&bright, 3.0 / 2.0) < pair(&bright, 32.0 / 21.0));
+    }
+
+    #[test]
+    fn fractional_partial_ratios_scale_with_fundamental() {
+        let profile = SpectrumProfile::new(vec![
+            ProfilePartial {
+                frequency_ratio: 1.0,
+                amplitude: 1.0,
+            },
+            ProfilePartial {
+                frequency_ratio: 4.03,
+                amplitude: 0.2,
+            },
+        ])
+        .unwrap();
+        let spectrum = SpectrumModel::from_profile(profile)
+            .spectrum(220.0)
+            .unwrap();
+        assert!((spectrum.partials()[1].frequency_hz - 886.6).abs() < 1e-10);
     }
 }

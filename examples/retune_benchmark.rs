@@ -5,7 +5,8 @@ use std::{
 };
 
 use adaptive_ji::tuning::{
-    ActiveNote, AdaptiveRationalOptimizer, OptimizerConfig, TuningStrategy, adaptive::AnchorMode,
+    ActiveNote, AdaptiveRationalOptimizer, OptimizerConfig, TuningStrategy,
+    profile::{ProfilePartial, SpectrumPreset, SpectrumProfile},
 };
 
 fn measure(label: &str, count: usize, mut retune: impl FnMut() -> Duration) {
@@ -20,18 +21,27 @@ fn measure(label: &str, count: usize, mut retune: impl FnMut() -> Duration) {
     );
 }
 
-fn compare(label: &str, count: usize, notes: &[ActiveNote], config: OptimizerConfig) {
+fn compare(
+    label: &str,
+    count: usize,
+    notes: &[ActiveNote],
+    config: OptimizerConfig,
+    profile: SpectrumProfile,
+) {
     println!(
-        "{label}: anchor={:?}, w_roughness={}",
-        config.anchor_mode, config.weights.roughness
+        "{label}: partials={}, anchor={:?}, w_roughness={}",
+        profile.partials().len(),
+        config.anchor_mode,
+        config.weights.roughness
     );
     measure("  Fresh chord (cold candidates)", count, || {
-        let mut optimizer = AdaptiveRationalOptimizer::new(config).unwrap();
+        let mut optimizer =
+            AdaptiveRationalOptimizer::with_profile(config, profile.clone()).unwrap();
         let start = Instant::now();
         black_box(optimizer.tune(black_box(notes)));
         start.elapsed()
     });
-    let mut optimizer = AdaptiveRationalOptimizer::new(config).unwrap();
+    let mut optimizer = AdaptiveRationalOptimizer::with_profile(config, profile).unwrap();
     optimizer.tune(notes);
     measure("  Held chord (warm candidates)", count, || {
         let start = Instant::now();
@@ -70,10 +80,28 @@ fn main() {
         })
         .collect();
     println!("15 voices; K=8, beam=2048; construction/logging/MIDI excluded");
-    let fixed = OptimizerConfig {
-        anchor_mode: AnchorMode::Fixed,
-        ..OptimizerConfig::default()
-    };
-    compare("v0.3 style", count, &notes, fixed);
-    compare("v0.4 floating", count, &notes, OptimizerConfig::default());
+    let config = OptimizerConfig::default();
+    for (name, preset) in [
+        ("sine", SpectrumPreset::Sine),
+        ("harmonic default", SpectrumPreset::Harmonic),
+        ("bright", SpectrumPreset::Bright),
+    ] {
+        compare(
+            name,
+            count,
+            &notes,
+            config,
+            SpectrumProfile::builtin(preset, config.roughness).unwrap(),
+        );
+    }
+    let custom = SpectrumProfile::new(
+        (1..=32)
+            .map(|n| ProfilePartial {
+                frequency_ratio: n as f64 * (1.0 + 0.0001 * (n - 1) as f64),
+                amplitude: 1.0 / n as f64,
+            })
+            .collect(),
+    )
+    .unwrap();
+    compare("custom 32-partial", count, &notes, config, custom);
 }

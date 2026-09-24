@@ -1,8 +1,8 @@
 [package]
 name = "adaptive-ji"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
-description = "Linux MIDI processor for adaptive just intonation with per-voice glide"
+description = "Linux MIDI processor for spectral-profile-aware adaptive just intonation"
 
 [dependencies]
 anyhow = "1"
@@ -11,3 +11,5 @@ ctrlc = { version = "3", features = ["termination"] }
 env_logger = "0.11"
 log = "0.4"
 midir = "0.11"
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"

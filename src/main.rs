@@ -1,10 +1,15 @@
+use std::path::PathBuf;
+
 use adaptive_ji::{
     glide::GlideConfig,
     midi,
     pitch_bend::BendRange,
     tuning::{
         AdaptiveRationalOptimizer, FiveLimitLowestRoot, OptimizerConfig, ScoreWeights,
-        TuningStrategy, adaptive::AnchorMode, roughness::RoughnessConfig,
+        TuningStrategy,
+        adaptive::AnchorMode,
+        profile::{SpectrumPreset, SpectrumProfile},
+        roughness::RoughnessConfig,
     },
 };
 use clap::{Parser, ValueEnum};
@@ -76,6 +81,14 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     roughness_rolloff: f64,
 
+    /// Built-in spectral shape used by sensory roughness
+    #[arg(long, value_enum, default_value = "harmonic")]
+    spectrum: SpectrumPreset,
+
+    /// Custom TOML spectral profile; overrides --spectrum and roughness generator options
+    #[arg(long)]
+    spectrum_file: Option<PathBuf>,
+
     /// Retune glide duration for already sounding voices, in ms (0..=2000)
     #[arg(long, default_value_t = 35)]
     glide_ms: u64,
@@ -105,6 +118,33 @@ fn main() -> anyhow::Result<()> {
     if args.list_inputs {
         midi::list_inputs()
     } else {
+        let roughness_config = if args.spectrum_file.is_some() {
+            // Generator options do not apply to a static custom spectrum.
+            RoughnessConfig::default()
+        } else {
+            RoughnessConfig {
+                partials: args.roughness_partials,
+                rolloff: args.roughness_rolloff,
+            }
+        };
+        let profile = if let Some(path) = &args.spectrum_file {
+            SpectrumProfile::from_toml_file(path).map_err(anyhow::Error::msg)?
+        } else {
+            SpectrumProfile::builtin(args.spectrum, roughness_config).map_err(anyhow::Error::msg)?
+        };
+        if let Some(path) = &args.spectrum_file {
+            log::info!(
+                "SPECTRUM custom path={} partials={}",
+                path.display(),
+                profile.partials().len()
+            );
+        } else {
+            log::info!(
+                "SPECTRUM {} partials={}",
+                format!("{:?}", args.spectrum).to_lowercase(),
+                profile.partials().len()
+            );
+        }
         let config = OptimizerConfig {
             max_deviation_cents: args.max_deviation,
             candidates_per_note: args.candidates_per_note,
@@ -117,16 +157,14 @@ fn main() -> anyhow::Result<()> {
                 movement: args.w_movement,
                 roughness: args.w_roughness,
             },
-            roughness: RoughnessConfig {
-                partials: args.roughness_partials,
-                rolloff: args.roughness_rolloff,
-            },
+            roughness: roughness_config,
         };
         config.validate().map_err(anyhow::Error::msg)?;
         let tuning: Box<dyn TuningStrategy> = match args.strategy {
-            Strategy::Adaptive => {
-                Box::new(AdaptiveRationalOptimizer::new(config).map_err(anyhow::Error::msg)?)
-            }
+            Strategy::Adaptive => Box::new(
+                AdaptiveRationalOptimizer::with_profile(config, profile)
+                    .map_err(anyhow::Error::msg)?,
+            ),
             Strategy::FiveLimit => Box::new(FiveLimitLowestRoot),
         };
         let glide = GlideConfig {

@@ -3,6 +3,7 @@ use std::{cmp::Ordering, collections::BTreeMap};
 use super::{
     ActiveNote, Ratio, TunedNote, TuningStrategy, VoiceId,
     candidates::{Candidate, CandidateGenerator},
+    profile::{SpectrumPreset, SpectrumProfile},
     rational::harmonic_complexity,
     roughness::{RoughnessConfig, Spectrum, SpectrumModel, fundamental_frequency, roughness},
 };
@@ -253,11 +254,21 @@ impl Default for AdaptiveRationalOptimizer {
 
 impl AdaptiveRationalOptimizer {
     pub fn new(config: OptimizerConfig) -> Result<Self, String> {
+        let profile = SpectrumProfile::builtin(SpectrumPreset::Harmonic, config.roughness)?;
+        Self::with_profile(config, profile)
+    }
+
+    pub fn with_profile(config: OptimizerConfig, profile: SpectrumProfile) -> Result<Self, String> {
         config.validate()?;
+        let spectrum_model = SpectrumModel::from_profile(profile);
+        // Reject finite-but-unrepresentable custom ratios at startup, not in a
+        // live NoteOn callback. The candidate spectrum is computed pre-anchor.
+        spectrum_model.spectrum(fundamental_frequency(0, -config.max_deviation_cents))?;
+        spectrum_model.spectrum(fundamental_frequency(127, config.max_deviation_cents))?;
         Ok(Self {
             config,
             generator: CandidateGenerator::new(config)?,
-            spectrum_model: SpectrumModel::new(config.roughness)?,
+            spectrum_model,
             previous: BTreeMap::new(),
             last_solution: None,
         })
@@ -522,6 +533,89 @@ mod tests {
 
     fn fixed_optimizer() -> AdaptiveRationalOptimizer {
         AdaptiveRationalOptimizer::new(fixed_config()).unwrap()
+    }
+
+    #[test]
+    fn spectral_profiles_can_change_optimizer_decision_at_high_roughness_weight() {
+        let mut config = fixed_config();
+        config.weights.roughness = 2500.0;
+        let mut sine = AdaptiveRationalOptimizer::with_profile(
+            config,
+            SpectrumProfile::builtin(SpectrumPreset::Sine, config.roughness).unwrap(),
+        )
+        .unwrap();
+        let mut bright = AdaptiveRationalOptimizer::with_profile(
+            config,
+            SpectrumProfile::builtin(SpectrumPreset::Bright, config.roughness).unwrap(),
+        )
+        .unwrap();
+        let pitches = notes(&[60, 67]);
+        let sine_ratios = ratios(&sine.tune(&pitches));
+        let bright_ratios = ratios(&bright.tune(&pitches));
+        assert_ne!(
+            sine_ratios, bright_ratios,
+            "sine={sine_ratios:?} bright={bright_ratios:?}"
+        );
+        assert_eq!(bright_ratios[1], "3/2");
+    }
+
+    #[test]
+    fn zero_roughness_weight_makes_profile_choice_irrelevant_and_all_presets_are_deterministic() {
+        let presets = [
+            SpectrumPreset::Harmonic,
+            SpectrumPreset::Sine,
+            SpectrumPreset::Saw,
+            SpectrumPreset::Square,
+            SpectrumPreset::Soft,
+            SpectrumPreset::Bright,
+        ];
+        let pitches = notes(&[60, 64, 67, 70]);
+        let mut config = OptimizerConfig::default();
+        config.weights.roughness = 0.0;
+        let baseline = AdaptiveRationalOptimizer::new(config)
+            .unwrap()
+            .tune(&pitches);
+        for preset in presets {
+            let profile = SpectrumProfile::builtin(preset, config.roughness).unwrap();
+            let first = AdaptiveRationalOptimizer::with_profile(config, profile.clone())
+                .unwrap()
+                .tune(&pitches);
+            let second = AdaptiveRationalOptimizer::with_profile(config, profile)
+                .unwrap()
+                .tune(&pitches);
+            assert_eq!(first, baseline, "preset={preset:?}");
+            assert_eq!(second, first, "preset={preset:?}");
+        }
+    }
+
+    #[test]
+    fn positive_roughness_is_deterministic_for_every_preset_and_rejects_unrepresentable_profile() {
+        let config = OptimizerConfig::default();
+        let pitches = notes(&[60, 64, 67, 70]);
+        for preset in [
+            SpectrumPreset::Harmonic,
+            SpectrumPreset::Sine,
+            SpectrumPreset::Saw,
+            SpectrumPreset::Square,
+            SpectrumPreset::Soft,
+            SpectrumPreset::Bright,
+        ] {
+            let profile = SpectrumProfile::builtin(preset, config.roughness).unwrap();
+            let mut first =
+                AdaptiveRationalOptimizer::with_profile(config, profile.clone()).unwrap();
+            let mut second = AdaptiveRationalOptimizer::with_profile(config, profile).unwrap();
+            assert_eq!(
+                first.tune(&pitches),
+                second.tune(&pitches),
+                "preset={preset:?}"
+            );
+        }
+        let too_high = SpectrumProfile::new(vec![crate::tuning::profile::ProfilePartial {
+            frequency_ratio: f64::MAX,
+            amplitude: 1.0,
+        }])
+        .unwrap();
+        assert!(AdaptiveRationalOptimizer::with_profile(config, too_high).is_err());
     }
 
     #[test]
