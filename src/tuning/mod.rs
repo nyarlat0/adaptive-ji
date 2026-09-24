@@ -1,6 +1,7 @@
 pub mod adaptive;
 pub mod candidates;
 mod five_limit;
+pub mod memory;
 pub mod prime_limit;
 pub mod profile;
 pub mod rational;
@@ -8,6 +9,7 @@ pub mod roughness;
 
 pub use adaptive::{AdaptiveRationalOptimizer, OptimizerConfig, ScoreWeights};
 pub use five_limit::FiveLimitLowestRoot;
+pub use memory::MemoryMode;
 pub use prime_limit::PrimeLimit;
 pub use rational::Ratio;
 

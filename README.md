@@ -1,4 +1,4 @@
-# adaptive-ji 0.95
+# adaptive-ji 1.0.0
 
 CLI-программа для Linux: принимает обычный MIDI 1.0 через `midir`/ALSA,
 подбирает контекстный adaptive just intonation с configurable arbitrary
@@ -71,6 +71,7 @@ adaptive-ji --input "KeyRig" --strategy five-limit -v
 adaptive-ji --input "KeyRig" --spectrum bright -v
 adaptive-ji --input "KeyRig" --spectrum-file spectrum.toml -v
 adaptive-ji --input "KeyRig" --prime-limit 11 --max-deviation 60 -v
+adaptive-ji --input "KeyRig" --memory-mode relations --w-memory 1.0 -v
 ```
 
 Настройки optimizer (показаны defaults):
@@ -107,6 +108,14 @@ p-limit разрешает все простые множители `<= p`. 5-li
 Кандидаты ищутся bounded best-first поиском по modified Tenney complexity;
 полного Cartesian произведения exponent axes нет. `--max-complexity` (default
 12) задаёт budget этого поиска.
+По умолчанию `--memory-mode off`: это полностью совместимый с v0.95 режим
+без memory lookup, memory costs и обновления состояния. Экспериментальный
+`--memory-mode relations` хранит до нескольких octave-equivalent rational
+relations между MIDI pitch classes. Настройки: `--w-memory 1.0`,
+`--memory-decay 0.80`, `--memory-reset-on-empty true`. Это не chord/key
+recognition и не ML: memory хранит sparse prime-exponent fingerprints, а не
+absolute cents, anchor, glide или MIDI channels. C# и Db намеренно совпадают.
+Memory обновляется после финального assignment, но не на glide ticks.
 `--anchor-mode fixed` воспроизводит привязку reference к 0 cents из v0.3.
 `--w-roughness 0` исключает pairwise roughness из поиска, но оставляет выбранный
 anchor mode. Для сравнения именно с v0.2 используйте обе настройки:
@@ -264,6 +273,7 @@ movement = sum over sounding voices: ((anchor + base_offset - current_audible_of
 roughness = sum over i < j: R(spectrum_i, spectrum_j)
 score = w_harmonic * harmonic + w_deviation * deviation
       + w_movement * movement + w_roughness * roughness
+      + w_memory * memory
 ```
 
 Например, complexity(3/2)=log2(3), complexity(6/5)=log2(15); октавы не меняют
@@ -327,7 +337,7 @@ optimizer v0.2 предпочитает G/E=32/27: G перемещается п
 обе высоты почти без движения. После C–E–G–Bb → E–G–Bb аналогично сохраняется
 1:6/5:7/5. В fixed mode новый reference снова принудительно получает offset=0.
 
-`Costs` хранит harmonic/deviation/movement/roughness раздельно; в `-v` видны
+`Costs` хранит harmonic/deviation/movement/roughness/memory раздельно; в `-v` видны
 все четыре слагаемых и общий score. В расчёте используются абсолютные частоты:
 
 ```text
@@ -507,6 +517,7 @@ src/
     candidates.rs        bounded arbitrary-prime search и кэш
     prime_limit.rs       PrimeLimit validation и effective prime set
     adaptive.rs          config, Costs, floating anchor, audible movement, beam search
+    memory.rs            experimental relation fingerprints, decay and pair costs
     profile.rs           нормированные built-in/custom spectral profiles
     roughness.rs         абсолютные spectra и pairwise sensory roughness
     five_limit.rs        FiveLimitLowestRoot
@@ -515,6 +526,7 @@ examples/
   glide_benchmark.rs      CPU-диагностика glide 15 voices без sleep/ALSA
   roughness_scan.rs       сравнение roughness кандидатов для двух MIDI notes
   ratio_scan.rs            кандидаты MIDI interval по prime limit
+  memory_demo.rs           краткая диагностика relation fingerprint
   spectrum_dump.rs        нормированные partials выбранного профиля
 ```
 

@@ -3,6 +3,7 @@ use std::{cmp::Ordering, collections::BTreeMap};
 use super::{
     ActiveNote, Ratio, TunedNote, TuningStrategy, VoiceId,
     candidates::{Candidate, CandidateGenerator},
+    memory::{MemoryMode, RelationMemory, pair_relation},
     prime_limit::PrimeLimit,
     profile::{SpectrumPreset, SpectrumProfile},
     rational::harmonic_complexity,
@@ -24,6 +25,7 @@ pub struct ScoreWeights {
     pub deviation: f64,
     pub movement: f64,
     pub roughness: f64,
+    pub memory: f64,
 }
 
 impl Default for ScoreWeights {
@@ -33,6 +35,7 @@ impl Default for ScoreWeights {
             deviation: 0.35,
             movement: 1.5,
             roughness: 20.0,
+            memory: 1.0,
         }
     }
 }
@@ -41,6 +44,9 @@ impl Default for ScoreWeights {
 pub struct OptimizerConfig {
     pub prime_limit: PrimeLimit,
     pub max_complexity: f64,
+    pub memory_mode: MemoryMode,
+    pub memory_decay: f64,
+    pub memory_reset_on_empty: bool,
     pub max_deviation_cents: f64,
     pub candidates_per_note: usize,
     pub beam_width: usize,
@@ -55,6 +61,9 @@ impl Default for OptimizerConfig {
         Self {
             prime_limit: PrimeLimit::default(),
             max_complexity: 12.0,
+            memory_mode: MemoryMode::Off,
+            memory_decay: 0.80,
+            memory_reset_on_empty: true,
             max_deviation_cents: 35.0,
             candidates_per_note: 8,
             beam_width: 2048,
@@ -96,6 +105,9 @@ impl OptimizerConfig {
                 return Err(format!("{name} must be finite and in 0..=1000000"));
             }
         }
+        if !self.memory_decay.is_finite() || !(0.0..=1.0).contains(&self.memory_decay) {
+            return Err("memory-decay must be finite and in 0..=1".into());
+        }
         Ok(())
     }
 }
@@ -107,6 +119,7 @@ pub struct Costs {
     pub deviation: f64,
     pub movement: f64,
     pub roughness: f64,
+    pub memory: f64,
 }
 
 impl Costs {
@@ -115,6 +128,7 @@ impl Costs {
             + weights.deviation * self.deviation
             + weights.movement * self.movement
             + weights.roughness * self.roughness
+            + weights.memory * self.memory
     }
 }
 
@@ -222,21 +236,26 @@ struct BeamEntry {
 pub struct PairCost {
     pub harmonic: f64,
     pub roughness: f64,
+    pub memory: f64,
 }
 
 fn pair_cost(
     left: Candidate,
     right: Candidate,
     spectra: Option<(&Spectrum, &Spectrum)>,
+    memory: Option<(&RelationMemory, u8, u8)>,
 ) -> PairCost {
+    let relation = right
+        .ratio
+        .checked_div(left.ratio)
+        .expect("bounded candidate pair");
     PairCost {
-        harmonic: harmonic_complexity(
-            right
-                .ratio
-                .checked_div(left.ratio)
-                .expect("bounded candidate pair"),
-        ),
+        harmonic: harmonic_complexity(relation),
         roughness: spectra.map_or(0.0, |(a, b)| roughness(a, b)),
+        memory: memory.map_or(0.0, |(state, left_pc, right_pc)| {
+            let (pair, relation) = pair_relation(left_pc, left.ratio, right_pc, right.ratio);
+            state.pair_cost(pair, &relation)
+        }),
     }
 }
 
@@ -254,6 +273,7 @@ pub struct AdaptiveRationalOptimizer {
     /// inspection only. Movement is always based on ActiveNote snapshots.
     previous: BTreeMap<VoiceId, f64>,
     last_solution: Option<AdaptiveSolution>,
+    relation_memory: RelationMemory,
 }
 
 impl Default for AdaptiveRationalOptimizer {
@@ -281,11 +301,16 @@ impl AdaptiveRationalOptimizer {
             spectrum_model,
             previous: BTreeMap::new(),
             last_solution: None,
+            relation_memory: RelationMemory::default(),
         })
     }
 
     pub fn last_solution(&self) -> Option<&AdaptiveSolution> {
         self.last_solution.as_ref()
+    }
+
+    pub fn relation_memory(&self) -> &RelationMemory {
+        &self.relation_memory
     }
 
     fn search(&mut self, notes: &[ActiveNote]) -> AdaptiveSolution {
@@ -356,6 +381,9 @@ impl AdaptiveRationalOptimizer {
                     .collect()
             });
         let mut pairs: Vec<Vec<Vec<PairCost>>> = Vec::with_capacity(notes.len());
+        let memory_lookup = (self.config.memory_mode == MemoryMode::Relations
+            && self.config.weights.memory > 0.0)
+            .then_some(&self.relation_memory);
         for (j, list) in candidates.iter().enumerate() {
             let mut row = Vec::with_capacity(j);
             for (i, prior) in candidates[..j].iter().enumerate() {
@@ -365,7 +393,18 @@ impl AdaptiveRationalOptimizer {
                         let pair_spectra = spectra
                             .as_ref()
                             .map(|spectra| (&spectra[i][left_index], &spectra[j][right_index]));
-                        matrix.push(pair_cost(left, right, pair_spectra));
+                        matrix.push(pair_cost(
+                            left,
+                            right,
+                            pair_spectra,
+                            memory_lookup.map(|memory| {
+                                (
+                                    memory,
+                                    ordered[i].input_note % 12,
+                                    ordered[j].input_note % 12,
+                                )
+                            }),
+                        ));
                     }
                 }
                 row.push(matrix);
@@ -421,6 +460,7 @@ impl AdaptiveRationalOptimizer {
                             pairs[j][i][choice * prior.len() + usize::from(entry.choices[i])];
                         next.costs.harmonic += pair.harmonic;
                         next.costs.roughness += pair.roughness;
+                        next.costs.memory += pair.memory;
                     }
                     next.score = next.costs.total(self.config.weights);
                     expanded.push(next);
@@ -466,15 +506,21 @@ impl TuningStrategy for AdaptiveRationalOptimizer {
         if active_notes.is_empty() {
             self.previous.clear();
             self.last_solution = None;
+            if self.config.memory_reset_on_empty {
+                self.relation_memory.clear();
+            }
             return Vec::new();
         }
         assert!(
             active_notes.len() <= MAX_VOICES,
             "adaptive optimizer supports at most 15 voices"
         );
+        if self.config.memory_mode == MemoryMode::Relations {
+            self.relation_memory.decay(self.config.memory_decay);
+        }
         let solution = self.search(active_notes);
         log::info!(
-            "ADAPTIVE score={:.6} reference={} voice={} anchor={:+.3}c cost: harmonic={:.6} deviation={:.6} movement={:.6} roughness={:.6}",
+            "ADAPTIVE score={:.6} reference={} voice={} anchor={:+.3}c cost: harmonic={:.6} deviation={:.6} movement={:.6} roughness={:.6} memory={:.6}",
             solution.score,
             crate::voice::note_name(solution.reference_note),
             solution.reference_id,
@@ -482,7 +528,8 @@ impl TuningStrategy for AdaptiveRationalOptimizer {
             solution.costs.harmonic,
             solution.costs.deviation,
             solution.costs.movement,
-            solution.costs.roughness
+            solution.costs.roughness,
+            solution.costs.memory
         );
         if log::log_enabled!(log::Level::Debug) {
             for (active, tuned) in active_notes.iter().zip(&solution.notes) {
@@ -509,6 +556,9 @@ impl TuningStrategy for AdaptiveRationalOptimizer {
             .map(|note| (note.id, note.cents_offset))
             .collect();
         let result = solution.notes.clone();
+        if self.config.memory_mode == MemoryMode::Relations {
+            self.relation_memory.record(active_notes, &result, 1.0);
+        }
         self.last_solution = Some(solution);
         result
     }
@@ -539,6 +589,31 @@ mod tests {
             anchor_mode: AnchorMode::Fixed,
             ..OptimizerConfig::default()
         }
+    }
+
+    #[test]
+    fn memory_off_is_stateless_and_relations_mode_records_only_after_tune() {
+        let chord = notes(&[60, 64, 67]);
+        let mut off = AdaptiveRationalOptimizer::default();
+        off.tune(&chord);
+        assert!(off.relation_memory().entries().is_empty());
+
+        let config = OptimizerConfig {
+            memory_mode: MemoryMode::Relations,
+            ..OptimizerConfig::default()
+        };
+        let mut on = AdaptiveRationalOptimizer::new(config).unwrap();
+        on.tune(&chord);
+        assert!(!on.relation_memory().entries().is_empty());
+        let mut no_memory_weight = config;
+        no_memory_weight.weights.memory = 0.0;
+        let mut baseline = AdaptiveRationalOptimizer::new(no_memory_weight).unwrap();
+        let mut off_weight = AdaptiveRationalOptimizer::default();
+        off_weight.tune(&chord);
+        assert_eq!(
+            off_weight.last_solution().unwrap().notes,
+            baseline.tune(&chord)
+        );
     }
 
     fn fixed_optimizer() -> AdaptiveRationalOptimizer {
@@ -961,13 +1036,13 @@ mod tests {
         let b = model
             .spectrum(fundamental_frequency(67, right.offset_cents))
             .unwrap();
-        let first = pair_cost(left, right, Some((&a, &b)));
-        let second = pair_cost(left, right, Some((&a, &b)));
+        let first = pair_cost(left, right, Some((&a, &b)), None);
+        let second = pair_cost(left, right, Some((&a, &b)), None);
         assert_eq!(first, second);
         assert!((first.harmonic - harmonic_complexity(right.ratio)).abs() < 1e-12);
         assert!((first.roughness - roughness(&a, &b)).abs() < 1e-12);
         assert!(first.roughness.is_finite() && first.roughness > 0.0);
-        assert_eq!(pair_cost(left, right, None).roughness, 0.0);
+        assert_eq!(pair_cost(left, right, None, None).roughness, 0.0);
     }
 
     #[test]

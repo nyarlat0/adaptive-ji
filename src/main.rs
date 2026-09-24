@@ -81,6 +81,22 @@ struct Args {
     #[arg(long, default_value_t = 20.0)]
     w_roughness: f64,
 
+    /// Experimental harmonic relation memory mode
+    #[arg(long, value_enum, default_value = "off")]
+    memory_mode: adaptive_ji::tuning::MemoryMode,
+
+    /// Experimental harmonic memory weight
+    #[arg(long, default_value_t = 1.0)]
+    w_memory: f64,
+
+    /// Harmonic memory decay per retune event
+    #[arg(long, default_value_t = 0.80)]
+    memory_decay: f64,
+
+    /// Clear experimental memory when all sounding voices disappear
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    memory_reset_on_empty: bool,
+
     /// Harmonic partials in the roughness model (1..=64)
     #[arg(long, default_value_t = 12)]
     roughness_partials: usize,
@@ -163,6 +179,9 @@ fn main() -> anyhow::Result<()> {
             prime_limit: args.prime_limit,
             max_deviation_cents: args.max_deviation,
             max_complexity: args.max_complexity,
+            memory_mode: args.memory_mode,
+            memory_decay: args.memory_decay,
+            memory_reset_on_empty: args.memory_reset_on_empty,
             candidates_per_note: args.candidates_per_note,
             beam_width: args.beam_width,
             anchor_mode: args.anchor_mode,
@@ -172,6 +191,7 @@ fn main() -> anyhow::Result<()> {
                 deviation: args.w_deviation,
                 movement: args.w_movement,
                 roughness: args.w_roughness,
+                memory: args.w_memory,
             },
             roughness: roughness_config,
         };
