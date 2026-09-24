@@ -38,11 +38,33 @@ fn receive_through(receiver: &Receiver<Vec<u8>>, last: [u8; 3]) -> Vec<Vec<u8>> 
     }
 }
 
+fn receive_count(receiver: &Receiver<Vec<u8>>, count: usize) -> Vec<Vec<u8>> {
+    let mut messages = Vec::with_capacity(count);
+    for _ in 0..count {
+        messages.push(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("missing MIDI output"),
+        );
+    }
+    messages
+}
+
+fn last_bend(messages: &[Vec<u8>], channel: u8) -> u16 {
+    let message = messages
+        .iter()
+        .rev()
+        .find(|message| message[0] == 0xe0 | channel)
+        .expect("missing member-channel bend");
+    u16::from(message[1]) | (u16::from(message[2]) << 7)
+}
+
 #[test]
 #[ignore = "requires /dev/snd/seq; run cargo test --test alsa_loopback -- --ignored"]
 fn actual_binary_routes_retunes_and_cleans_up_on_sigint() {
     // Sequential runs keep the existing baseline regression and exercise the new default.
     run_strategy("five-limit");
+    run_strategy("adaptive-fixed");
     run_strategy("adaptive");
     run_strategy("adaptive-zero");
 }
@@ -69,6 +91,7 @@ fn run_strategy(strategy: &str) {
             // Omit the flag for adaptive to check the CLI default as well.
             .args(match strategy {
                 "five-limit" => vec!["--strategy", "five-limit"],
+                "adaptive-fixed" => vec!["--anchor-mode", "fixed"],
                 "adaptive-zero" => vec!["--w-roughness", "0"],
                 _ => vec![],
             })
@@ -123,17 +146,32 @@ fn run_strategy(strategy: &str) {
 
     keyboard.send(&[0x90, 64, 100]).unwrap();
     let e = receive_through(&receiver, [0x92, 64, 100]);
-    assert!(e.contains(&encode_pitch_bend(2, 7631).to_vec()));
+    let e_bend = last_bend(&e, 2);
+    assert_eq!(e[e.len() - 2], encode_pitch_bend(2, e_bend));
+    if matches!(strategy, "five-limit" | "adaptive-fixed") {
+        assert_eq!(e_bend, 7631);
+    }
 
     keyboard.send(&[0x90, 67, 100]).unwrap();
     let g = receive_through(&receiver, [0x93, 67, 100]);
-    assert!(g.contains(&encode_pitch_bend(3, 8272).to_vec()));
+    let g_bend = last_bend(&g, 3);
+    assert_eq!(g[g.len() - 2], encode_pitch_bend(3, g_bend));
+    if matches!(strategy, "five-limit" | "adaptive-fixed") {
+        assert_eq!(g_bend, 8272);
+    }
 
-    if strategy != "five-limit" {
+    let (previous_e, previous_g) = if strategy != "five-limit" {
         keyboard.send(&[0x90, 70, 100]).unwrap();
         let seventh = receive_through(&receiver, [0x94, 70, 100]);
-        let cents = 1200.0 * (7.0_f64 / 4.0).log2() - 1000.0;
-        assert!(seventh.contains(&encode_pitch_bend(4, cents_to_pitch_bend(cents, 2.0)).to_vec()));
+        let seventh_bend = last_bend(&seventh, 4);
+        assert_eq!(
+            seventh[seventh.len() - 2],
+            encode_pitch_bend(4, seventh_bend)
+        );
+        if strategy == "adaptive-fixed" {
+            let cents = 1200.0 * (7.0_f64 / 4.0).log2() - 1000.0;
+            assert_eq!(seventh_bend, cents_to_pitch_bend(cents, 2.0));
+        }
         assert_eq!(
             seventh
                 .iter()
@@ -142,27 +180,37 @@ fn run_strategy(strategy: &str) {
             1
         );
         keyboard.send(&[0x80, 70, 0]).unwrap();
-        let released = receive_through(&receiver, encode_pitch_bend(3, 8272));
+        let released = receive_count(&receiver, 5);
         assert_eq!(released[0], [0x84, 70, 0]);
         assert!(!released.iter().any(|message| message[0] & 0xf0 == 0x90));
-    }
-
-    // E becomes the new reference (adaptive) or root (five-limit). Adaptive
-    // movement cost prefers 32/27 here, reducing the jump of the already held G.
-    keyboard.send(&[0x80, 60, 45]).unwrap();
-    let ratio: f64 = if strategy != "five-limit" {
-        32.0 / 27.0
+        (last_bend(&released, 2), last_bend(&released, 3))
     } else {
-        6.0 / 5.0
+        (last_bend(&g, 2), g_bend)
     };
-    let g_relative_to_e = 1200.0 * ratio.log2() - 300.0;
-    let retuned = receive_through(
-        &receiver,
-        encode_pitch_bend(3, cents_to_pitch_bend(g_relative_to_e, 2.0)),
-    );
+
+    // E becomes the new reference (adaptive) or root (five-limit).
+    keyboard.send(&[0x80, 60, 45]).unwrap();
+    let retuned = receive_count(&receiver, 4);
     assert_eq!(retuned[0], [0x81, 60, 45]);
-    assert!(retuned.contains(&vec![0xe2, 0, 64]));
+    assert_eq!(retuned[1], encode_pitch_bend(1, 8192));
     assert!(!retuned.iter().any(|message| message[0] & 0xf0 == 0x90));
+    let new_e = last_bend(&retuned, 2);
+    let new_g = last_bend(&retuned, 3);
+    if matches!(strategy, "five-limit" | "adaptive-fixed") {
+        assert_eq!(new_e, 8192);
+        let ratio: f64 = if strategy == "five-limit" {
+            6.0 / 5.0
+        } else {
+            32.0 / 27.0
+        };
+        let g_relative_to_e = 1200.0 * ratio.log2() - 300.0;
+        assert_eq!(new_g, cents_to_pitch_bend(g_relative_to_e, 2.0));
+    } else {
+        let cents_per_bend = 200.0 / 8192.0;
+        assert!((i32::from(new_e) - i32::from(previous_e)).abs() as f64 * cents_per_bend < 2.0);
+        assert!((i32::from(new_g) - i32::from(previous_g)).abs() as f64 * cents_per_bend < 2.0);
+        assert_ne!(new_e, 8192);
+    }
 
     assert!(
         Command::new("kill")

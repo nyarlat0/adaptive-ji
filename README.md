@@ -1,4 +1,4 @@
-# adaptive-ji 0.3
+# adaptive-ji 0.4
 
 CLI-программа для Linux: принимает обычный MIDI 1.0 через `midir`/ALSA,
 подбирает контекстный 7-limit just intonation для всего аккорда с учётом
@@ -49,7 +49,7 @@ adaptive score. `-vv` дополнительно показывает debug-со
 
 ```bash
 adaptive-ji --input "KeyRig" --strategy adaptive -v
-adaptive-ji --input "KeyRig" --strategy adaptive --w-roughness 0 -v
+adaptive-ji --input "KeyRig" --strategy adaptive --anchor-mode fixed -v
 adaptive-ji --input "KeyRig" --strategy five-limit -v
 ```
 
@@ -58,17 +58,22 @@ adaptive-ji --input "KeyRig" --strategy five-limit -v
 ```bash
 adaptive-ji --input "KeyRig" --strategy adaptive \
   --max-deviation 35 --candidates-per-note 8 --beam-width 2048 \
+  --anchor-mode floating --anchor-max 35 \
   --w-harmonic 1 --w-deviation 0.35 --w-movement 1.5 --w-roughness 20 \
   --roughness-partials 12 --roughness-rolloff 1.0
 ```
 
 `--max-deviation` принимает 0..100 cents, `--candidates-per-note` — 1..32,
 `--beam-width` — 1..16384. Веса — конечные неотрицательные числа до 1000000.
+`--anchor-mode` принимает `floating` (default) или `fixed`; `--anchor-max`
+принимает 0..100 cents, default 35. Он ограничивает общий абсолютный сдвиг строя.
 `--roughness-partials` — 1..64; `--roughness-rolloff` — 0.1..4.0.
 Нулевые K/beam и NaN/бесконечности отклоняются до открытия MIDI-порта.
 Более широкий beam и больше candidates увеличивают время пересчёта.
-`--w-roughness 0` полностью исключает построение спектров и pairwise roughness
-из поиска, восстанавливая scoring и канонические решения v0.2.
+`--anchor-mode fixed` воспроизводит привязку reference к 0 cents из v0.3.
+`--w-roughness 0` исключает pairwise roughness из поиска, но оставляет выбранный
+anchor mode. Для сравнения именно с v0.2 используйте обе настройки:
+`--anchor-mode fixed --w-roughness 0`.
 
 ## Surge XT standalone
 
@@ -91,11 +96,13 @@ KeyRig 49 → adaptive-ji → Adaptive JI Out → Surge XT → audio output
    sustain и обычным исходным строем 12-TET; отключите дополнительный microtuning.
 
 Для первой проверки сыграйте MIDI **60, 64, 67** (C4, E4, G4 в принятой здесь
-нумерации). E получит около −13.686 cents, G около +1.955 cents, C останется
-на исходной высоте, если C нажата первой. Добавьте **Bb4, MIDI 70**:
-optimizer выберет гармоническую септиму 7/4 (около −31.174 cents), получив 4:5:6:7.
+нумерации). Отношения станут примерно C:E:G = 4:5:6. При первом одиночном C
+offset будет 0; в аккорде общий floating anchor может немного сдвинуть C и
+соответственно E/G. Добавьте **Bb4, MIDI 70**: optimizer выберет гармоническую
+септиму 7/4, получив 4:5:6:7.
 Удерживая E/G/Bb, отпустите C: reference станет E, удерживаемые голоса получат
-новые bend без retrigger. В логах Bb обозначается как A#.
+новые bend без retrigger и останутся почти на тех же абсолютных высотах.
+В логах Bb обозначается как A#.
 
 В adaptive добавление/удаление любой ноты может изменить решение: все пары
 участвуют в score. Movement penalty может сохранить прежние offsets, если
@@ -146,10 +153,11 @@ MIDI backend/bridge в аудиосистеме и доступ процесса
 ### AdaptiveRationalOptimizer (по умолчанию)
 
 Reference — самый старый активный voice (минимальный монотонный ID allocator),
-а не lowest note или распознанный root. Он фиксирован в 1/1, offset = 0 cents.
-Остальные ratios задают интервалы относительно него. Например, если сначала
-сыграть E4, затем G4 и C5, решение будет E=1/1, G=6/5, C=8/5; интервал C/G=4/3.
-У C в этом обращении нет требования оставаться на 0 cents.
+а не lowest note или распознанный root. Его **rational ratio всегда 1/1**,
+но в floating mode его фактический offset равен общему `anchor_cents` и может
+быть отличен от нуля. Остальные ratios задают интервалы относительно него.
+Например, если сначала сыграть E4, затем G4 и C5, решение может быть
+E=1/1, G=6/5, C=8/5; интервал C/G=4/3. Общий anchor не меняет эти отношения.
 
 `Ratio` хранит положительные сокращённые `u64` numerator/denominator. Умножение,
 деление и масштабирование на степени двойки проверяют переполнение и выполняют
@@ -157,7 +165,7 @@ Reference — самый старый активный voice (минимальн
 7: −2..2 (315 сочетаний); степень двойки выбирается под MIDI-интервал, включая
 отрицательные интервалы и несколько октав.
 
-Candidates фильтруются по `abs(offset) <= max_deviation`, затем ранжируются по
+Candidates фильтруются по `abs(base_offset) <= max_deviation`, затем ранжируются по
 `w_harmonic * complexity(ratio) + w_deviation * (offset/25)^2`, и остаются лучшие K.
 При равенстве используются абсолютное отклонение и целочисленные numerator/denominator.
 Это только предварительное сокращение набора: итоговые harmonic и roughness
@@ -170,14 +178,50 @@ score считают **все** пары с одинаковым весом, б�
 например, нулевое окно не может точно представить большинство интервалов 12-TET
 рациональными числами. При defaults fallback для MIDI-интервалов −127..127 не нужен.
 
+Для каждого candidate сначала считается `base_i = cents(ratio_i) −
+100·(midi_i − midi_reference)`. Фактический `offset_i = anchor + base_i`.
+Для reference base=0, но actual offset не обязан быть нулём.
+
+Допустимый anchor для полного или частичного assignment — пересечение:
+
+```text
+[-anchor_max, +anchor_max]
+∩ [-max_deviation - base_i, +max_deviation - base_i] для каждого обычного candidate i
+```
+
+При `--anchor-mode fixed` anchor строго 0 и старый score v0.3 сохраняется.
+При floating ограничения гарантируют `abs(actual_offset_i) <= max_deviation`
+для обычных candidates. Fallback за пределами невозможного узкого candidate
+окна сохраняет документированное исключение v0.3: для него этот предел не
+применяется, иначе при некоторых допустимых настройках решения не существует.
+
+Deviation и movement зависят от anchor квадратично. Beam state хранит число
+voices `N`, число ранее звучавших `H`, суммы `Σbase`, `Σbase²`,
+`Σ(base−previous)` и `Σ(base−previous)²`. Для каждого partial assignment:
+
+```text
+Q(anchor) = A*anchor² + B*anchor + C
+A = w_deviation*N/625 + w_movement*H/100
+B = 2*(w_deviation*Σbase/625 + w_movement*Σ(base−previous)/100)
+C = w_deviation*Σbase²/625 + w_movement*Σ(base−previous)²/100
+anchor_opt = clamp(-B/(2*A), feasible_interval)   при A > 0
+```
+
+Если A=0, выбирается ближайший к нулю допустимый anchor. Это абсолютная
+оптимизация относительно 12-TET на **каждом** retune: прежний anchor не
+накапливается и не добавляется инкрементально. После отпускания всех нот
+история очищается, новая одиночная нота снова имеет offset=0.
+Оптимизированный Q участвует в отсечении partial beam assignments, то есть
+ratios и anchor выбираются совместно.
+
 Для сокращённого p/q удаляются все степени двойки из обеих частей:
 
 ```text
 complexity(p/q) = log2(odd_num) + log2(odd_den)
 
 harmonic = sum over i < j: complexity(ratio_j / ratio_i)
-deviation = sum: (offset / 25)^2
-movement = sum over previously held voices: ((offset - previous_offset) / 10)^2
+deviation = sum: ((anchor + base_offset) / 25)^2
+movement = sum over previously held voices: ((anchor + base_offset - previous_offset) / 10)^2
 roughness = sum over i < j: R(spectrum_i, spectrum_j)
 score = w_harmonic * harmonic + w_deviation * deviation
       + w_movement * movement + w_roughness * roughness
@@ -192,21 +236,24 @@ Beam search сначала назначает reference, затем осталь
 назначенными voices, после чего сохраняются лучшие `beam-width` вариантов.
 Каждая unordered pair учитывается ровно один раз. Все tie-breaks детерминированы.
 Парные `PairCost { harmonic, roughness }` и candidate spectra заранее вычисляются;
-в цикле расширения нет gcd/log2, exp, pow и генерации спектров.
+в цикле расширения нет gcd/log2, exp, pow и генерации спектров. Roughness v0.4
+сознательно рассчитывается **до** общего anchor shift: он немного меняет
+абсолютные частоты, поэтому roughness после сдвига здесь приближена. Это сохраняет
+быструю pairwise precomputation; более точный пересчёт оставлен на будущую версию.
 Сложность порядка O(beam × K × N²), плюс отбор/сортировка beam; полный K^N не перебирается.
 Beam search и отсечение candidates приближённые: глобальный минимум не гарантируется.
 
-Defaults дают и при свежем, и при последовательном нажатии C–E–G–Bb:
+Ratios по умолчанию для C–E–G–Bb, свежего и последовательного аккорда:
 
 ```text
-C4   1/1    +0.000 cents
-E4   5/4   -13.686 cents
-G4   3/2    +1.955 cents
-Bb4  7/4   -31.174 cents
+C4   1/1    anchor
+E4   5/4    anchor - 13.686 cents
+G4   3/2    anchor + 1.955 cents
+Bb4  7/4    anchor - 31.174 cents
 ```
 
 История может изменять выбор в других последовательностях — это назначение
-movement term. Например, после отпускания C из C–E–G при `--w-roughness 0`
+movement term. В fixed mode после отпускания C из C–E–G при `--w-roughness 0`
 optimizer v0.2 предпочитает G/E=32/27: G перемещается примерно на 7.820 cents.
 При `--w-movement 0` выбирается более простой 6/5 с движением G на 13.686 cents.
 Новая модель для E4–G4 даёт roughness около 0.08217 для 6/5 и 0.09325 для
@@ -214,11 +261,11 @@ optimizer v0.2 предпочитает G/E=32/27: G перемещается п
 может перевесить движение и выбрать менее грубый интервал 6/5. Обычный вес
 20 оставляет канонические аккорды 4:5:6 и 4:5:6:7.
 
-**Смена reference:** новый старейший voice обязательно получает offset = 0.
-Movement penalty учитывает фактические прежние offsets относительно 12-TET,
-без переопределения их начала отсчёта; она не может отменить фиксацию reference.
-Поэтому отпускание reference может вызвать слышимое движение высоты даже при
-большом весе movement. Никакого накопления абсолютного дрейфа строя нет.
+**Смена reference:** в floating mode новый старейший voice может сохранить
+прежний абсолютный offset: его ratio становится 1/1, а anchor подбирается близко
+к предыдущей высоте. После C–E–G → E–G система E:G=1:6/5 способна сохранить
+обе высоты почти без движения. После C–E–G–Bb → E–G–Bb аналогично сохраняется
+1:6/5:7/5. В fixed mode новый reference снова принудительно получает offset=0.
 
 `Costs` хранит harmonic/deviation/movement/roughness раздельно; в `-v` видны
 все четыре слагаемых и общий score. В расчёте используются абсолютные частоты:
@@ -255,10 +302,10 @@ cargo run --release --example roughness_scan -- 60 67
 cargo run --release --example roughness_scan -- 64 67
 ```
 
-Выводятся ratio, cents, offset, harmonic complexity и roughness относительно
-первой ноты, принятой за reference с offset 0. Пример показывает индивидуальные
+Выводятся ratio, cents, **base offset**, harmonic complexity и roughness относительно
+первой ноты, принятой за reference с anchor 0. Пример показывает индивидуальные
 парные значения; итоговый optimizer считает пары **всех** одновременно звучащих
-нот и также учитывает движение и отклонение от 12-TET.
+нот и также учитывает движение, отклонение от 12-TET и floating anchor.
 
 ### FiveLimitLowestRoot (сохранённый baseline v0.1)
 
@@ -351,7 +398,7 @@ src/
     mod.rs               ActiveNote, TunedNote, TuningStrategy
     rational.rs          reduced Ratio, checked arithmetic, complexity
     candidates.rs        7-limit lattice, pruning и кэш по интервалам
-    adaptive.rs          config, Costs, история voices, beam search
+    adaptive.rs          config, Costs, floating anchor, история voices, beam search
     roughness.rs         гармонические partials и pairwise sensory roughness
     five_limit.rs        FiveLimitLowestRoot
 examples/
@@ -376,6 +423,10 @@ CC и сообщения очистки, а также рациональную 
 4:5:6, 4:5:6:7, обращения, movement penalty, детерминизм и 15 voices.
 Roughness покрыта тестами спектра, нормализации, симметрии, простых интервалов,
 границ параметров, A/B E–G и влияния веса на выбор.
+Floating anchor проверен аналитической минимизацией против плотной сетки,
+ограничением диапазона, сохранением E/G и E/G/Bb после смены reference,
+повторными voice IDs и сбросом истории после полного отпускания нот. Fixed mode
+проверяется прежними каноническими тестами v0.3.
 Для маленького аккорда beam search сверяется с отдельным полным перебором.
 Отдельный интеграционный тест требует доступного ALSA
 sequencer, но не физической клавиатуры или синтезатора:
@@ -385,8 +436,10 @@ cargo test --test alsa_loopback -- --ignored
 ```
 
 Он создаёт временный виртуальный источник и монитор, запускает настоящий бинарник,
-проверяет обе стратегии и `--w-roughness 0` через ALSA, включая C–E–G, адаптивную септиму, смену
-reference/root без retrigger и очистку при SIGINT. По умолчанию этот тест пропущен, чтобы `cargo test` работал без
+проверяет five-limit, adaptive fixed, adaptive floating и floating с
+`--w-roughness 0` через ALSA, включая C–E–G, септиму, смену reference/root без
+retrigger, непрерывность bend и очистку при SIGINT. По умолчанию этот тест
+пропущен, чтобы `cargo test` работал без
 `/dev/snd/seq`. Звучание в standalone/Ardour проверяется вручную по сценариям выше.
 
 ### Performance sanity check
@@ -396,13 +449,13 @@ cargo run --release --example retune_benchmark -- 100
 ```
 
 Без жёстких timing assertions. Пример на AMD Ryzen 9 5900X, release,
-K=8/beam=2048, 30 повторов плотного 15-голосного набора:
+K=8/beam=2048, `w_roughness=20`, 30 повторов плотного 15-голосного набора:
 
-| Сценарий | `--w-roughness 0` среднее | Default 20 среднее |
+| Сценарий | Fixed среднее | Floating среднее |
 | --- | ---: | ---: |
-| Свежий аккорд | 5.028 мс | 10.551 мс |
-| Удерживаемые 15 voices | 5.052 мс | 10.429 мс |
-| Добавление/отпускание 15-го voice | 4.764 мс | 9.822 мс |
+| Свежий аккорд | 11.990 мс | 12.216 мс |
+| Удерживаемые 15 voices | 11.612 мс | 12.194 мс |
+| Добавление/отпускание 15-го voice | 11.063 мс | 11.657 мс |
 
 Измеряется только `tune()`, без создания optimizer, MIDI I/O и логирования.
 Это ориентир конкретного запуска, а не гарантия задержки; параметры поиска,

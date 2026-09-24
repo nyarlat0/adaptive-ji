@@ -5,7 +5,7 @@ use std::{
 };
 
 use adaptive_ji::tuning::{
-    ActiveNote, AdaptiveRationalOptimizer, OptimizerConfig, ScoreWeights, TuningStrategy,
+    ActiveNote, AdaptiveRationalOptimizer, OptimizerConfig, TuningStrategy, adaptive::AnchorMode,
 };
 
 fn measure(label: &str, count: usize, mut retune: impl FnMut() -> Duration) {
@@ -21,7 +21,10 @@ fn measure(label: &str, count: usize, mut retune: impl FnMut() -> Duration) {
 }
 
 fn compare(label: &str, count: usize, notes: &[ActiveNote], config: OptimizerConfig) {
-    println!("{label}: w_roughness={}", config.weights.roughness);
+    println!(
+        "{label}: anchor={:?}, w_roughness={}",
+        config.anchor_mode, config.weights.roughness
+    );
     measure("  Fresh chord (cold candidates)", count, || {
         let mut optimizer = AdaptiveRationalOptimizer::new(config).unwrap();
         let start = Instant::now();
@@ -67,18 +70,10 @@ fn main() {
         })
         .collect();
     println!("15 voices; K=8, beam=2048; construction/logging/MIDI excluded");
-    let old = OptimizerConfig {
-        weights: ScoreWeights {
-            roughness: 0.0,
-            ..ScoreWeights::default()
-        },
+    let fixed = OptimizerConfig {
+        anchor_mode: AnchorMode::Fixed,
         ..OptimizerConfig::default()
     };
-    compare("v0.2 equivalent", count, &notes, old);
-    compare(
-        "roughness enabled",
-        count,
-        &notes,
-        OptimizerConfig::default(),
-    );
+    compare("v0.3 style", count, &notes, fixed);
+    compare("v0.4 floating", count, &notes, OptimizerConfig::default());
 }

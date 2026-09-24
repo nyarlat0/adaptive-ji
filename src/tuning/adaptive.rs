@@ -9,6 +9,13 @@ use super::{
 
 pub const MAX_VOICES: usize = 15;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum AnchorMode {
+    #[default]
+    Floating,
+    Fixed,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ScoreWeights {
     pub harmonic: f64,
@@ -35,6 +42,8 @@ pub struct OptimizerConfig {
     pub beam_width: usize,
     pub weights: ScoreWeights,
     pub roughness: RoughnessConfig,
+    pub anchor_mode: AnchorMode,
+    pub anchor_max_cents: f64,
 }
 
 impl Default for OptimizerConfig {
@@ -45,6 +54,8 @@ impl Default for OptimizerConfig {
             beam_width: 2048,
             weights: ScoreWeights::default(),
             roughness: RoughnessConfig::default(),
+            anchor_mode: AnchorMode::Floating,
+            anchor_max_cents: 35.0,
         }
     }
 }
@@ -52,6 +63,9 @@ impl Default for OptimizerConfig {
 impl OptimizerConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.roughness.validate()?;
+        if !self.anchor_max_cents.is_finite() || !(0.0..=100.0).contains(&self.anchor_max_cents) {
+            return Err("anchor-max must be finite and in 0..=100 cents".into());
+        }
         if !self.max_deviation_cents.is_finite()
             || !(0.0..=100.0).contains(&self.max_deviation_cents)
         {
@@ -106,6 +120,83 @@ pub struct AdaptiveSolution {
     pub notes: Vec<TunedNote>,
     pub costs: Costs,
     pub score: f64,
+    pub anchor_cents: f64,
+}
+
+/// Q(a) = w_dev * sum((a + b)/25)^2
+///      + w_move * sum_held((a + b - previous)/10)^2.
+/// Each candidate updates these sufficient statistics in O(1).
+#[derive(Clone, Copy, Debug, Default)]
+struct QuadraticStats {
+    count: f64,
+    held: f64,
+    sum_base: f64,
+    sum_base_sq: f64,
+    sum_delta: f64,
+    sum_delta_sq: f64,
+}
+
+impl QuadraticStats {
+    fn add(&mut self, base: f64, previous: Option<f64>) {
+        self.count += 1.0;
+        self.sum_base += base;
+        self.sum_base_sq += base * base;
+        if let Some(previous) = previous {
+            let delta = base - previous;
+            self.held += 1.0;
+            self.sum_delta += delta;
+            self.sum_delta_sq += delta * delta;
+        }
+    }
+
+    fn coefficients(self, weights: ScoreWeights) -> (f64, f64, f64) {
+        let a = weights.deviation * self.count / 625.0 + weights.movement * self.held / 100.0;
+        let b = 2.0
+            * (weights.deviation * self.sum_base / 625.0
+                + weights.movement * self.sum_delta / 100.0);
+        let c = weights.deviation * self.sum_base_sq / 625.0
+            + weights.movement * self.sum_delta_sq / 100.0;
+        (a, b, c)
+    }
+
+    fn costs_at(self, anchor: f64) -> (f64, f64) {
+        let deviation =
+            (self.count * anchor * anchor + 2.0 * anchor * self.sum_base + self.sum_base_sq)
+                / 625.0;
+        let movement =
+            (self.held * anchor * anchor + 2.0 * anchor * self.sum_delta + self.sum_delta_sq)
+                / 100.0;
+        (deviation.max(0.0), movement.max(0.0))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AnchorBounds {
+    lower: f64,
+    upper: f64,
+}
+
+impl AnchorBounds {
+    fn restrict(self, base: f64, max_deviation: f64) -> Option<Self> {
+        let lower = self.lower.max(-max_deviation - base);
+        let upper = self.upper.min(max_deviation - base);
+        (lower <= upper).then_some(Self { lower, upper })
+    }
+
+    fn minimize(self, stats: QuadraticStats, weights: ScoreWeights) -> f64 {
+        let (a, b, _) = stats.coefficients(weights);
+        let unconstrained = if a > 0.0 { -b / (2.0 * a) } else { 0.0 };
+        unconstrained.clamp(self.lower, self.upper)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UnaryTerm {
+    base: f64,
+    previous: Option<f64>,
+    deviation: f64,
+    movement: f64,
+    fallback: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +204,9 @@ struct BeamEntry {
     choices: [u8; MAX_VOICES],
     costs: Costs,
     score: f64,
+    stats: QuadraticStats,
+    bounds: AnchorBounds,
+    anchor: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -181,43 +275,50 @@ impl AdaptiveRationalOptimizer {
             .expect("nonempty chord");
         let mut ordered = notes.to_vec();
         ordered.sort_unstable_by_key(|note| (note.id != reference.id, note.input_note, note.id));
+        let mut fallback_notes = Vec::with_capacity(ordered.len());
         let candidates: Vec<Vec<Candidate>> = ordered
             .iter()
             .map(|note| {
                 if note.id == reference.id {
+                    fallback_notes.push(false);
                     vec![Candidate {
                         ratio: Ratio::ONE,
                         offset_cents: 0.0,
                     }]
                 } else {
-                    self.generator
-                        .for_interval(i16::from(note.input_note) - i16::from(reference.input_note))
-                        .candidates
-                        .clone()
+                    let set = self
+                        .generator
+                        .for_interval(i16::from(note.input_note) - i16::from(reference.input_note));
+                    fallback_notes.push(set.used_fallback);
+                    set.candidates.clone()
                 }
             })
             .collect();
 
         // Cache all unary terms and all unordered pair matrices. No gcd/log2 in
         // the beam expansion; each edge's complexity has the same weight.
-        let unary: Vec<Vec<Costs>> = ordered
+        let unary: Vec<Vec<UnaryTerm>> = ordered
             .iter()
             .zip(&candidates)
-            .map(|(note, list)| {
+            .enumerate()
+            .map(|(index, (note, list))| {
                 list.iter()
-                    .map(|candidate| Costs {
-                        harmonic: 0.0,
+                    .map(|candidate| UnaryTerm {
+                        base: candidate.offset_cents,
+                        previous: self.previous.get(&note.id).copied(),
                         deviation: (candidate.offset_cents / 25.0).powi(2),
                         movement: movement_cost(
                             candidate.offset_cents,
                             self.previous.get(&note.id).copied(),
                         ),
-                        roughness: 0.0,
+                        fallback: fallback_notes[index],
                     })
                     .collect()
             })
             .collect();
-        // Zero weight preserves the v0.2 search and avoids all spectrum/pair exp work.
+        // Deliberate v0.4 approximation: pair roughness is evaluated before the
+        // common anchor shift. Interval ratios are invariant, but absolute Hz are not.
+        // Zero roughness weight avoids all spectrum/pair exp work.
         let spectra: Option<Vec<Vec<Spectrum>>> =
             (self.config.weights.roughness > 0.0).then(|| {
                 ordered
@@ -258,6 +359,12 @@ impl AdaptiveRationalOptimizer {
             choices: [0; MAX_VOICES],
             costs: Costs::default(),
             score: 0.0,
+            stats: QuadraticStats::default(),
+            bounds: AnchorBounds {
+                lower: -self.config.anchor_max_cents,
+                upper: self.config.anchor_max_cents,
+            },
+            anchor: 0.0,
         }];
         let mut expanded =
             Vec::with_capacity(self.config.beam_width * self.config.candidates_per_note);
@@ -267,8 +374,30 @@ impl AdaptiveRationalOptimizer {
                 for (choice, terms) in unary[j].iter().enumerate() {
                     let mut next = *entry;
                     next.choices[j] = choice as u8;
-                    next.costs.deviation += terms.deviation;
-                    next.costs.movement += terms.movement;
+                    match self.config.anchor_mode {
+                        AnchorMode::Fixed => {
+                            // Keep the v0.3 accumulation order and score path.
+                            next.costs.deviation += terms.deviation;
+                            next.costs.movement += terms.movement;
+                        }
+                        AnchorMode::Floating => {
+                            // A fallback outside an impossibly narrow candidate
+                            // window retains the pre-existing explicit exception.
+                            if !terms.fallback {
+                                let Some(bounds) = next
+                                    .bounds
+                                    .restrict(terms.base, self.config.max_deviation_cents + 1e-9)
+                                else {
+                                    continue;
+                                };
+                                next.bounds = bounds;
+                            }
+                            next.stats.add(terms.base, terms.previous);
+                            next.anchor = next.bounds.minimize(next.stats, self.config.weights);
+                            (next.costs.deviation, next.costs.movement) =
+                                next.stats.costs_at(next.anchor);
+                        }
+                    }
                     for (i, prior) in candidates[..j].iter().enumerate() {
                         let pair =
                             pairs[j][i][choice * prior.len() + usize::from(entry.choices[i])];
@@ -298,7 +427,7 @@ impl AdaptiveRationalOptimizer {
                     TunedNote {
                         id: note.id,
                         ratio: candidate.ratio,
-                        cents_offset: candidate.offset_cents,
+                        cents_offset: candidate.offset_cents + best.anchor,
                     },
                 )
             })
@@ -309,6 +438,7 @@ impl AdaptiveRationalOptimizer {
             notes: notes.iter().map(|note| selected[&note.id]).collect(),
             costs: best.costs,
             score: best.score,
+            anchor_cents: best.anchor,
         }
     }
 }
@@ -326,15 +456,32 @@ impl TuningStrategy for AdaptiveRationalOptimizer {
         );
         let solution = self.search(active_notes);
         log::info!(
-            "ADAPTIVE score={:.6} reference={} voice={} cost: harmonic={:.6} deviation={:.6} movement={:.6} roughness={:.6}",
+            "ADAPTIVE score={:.6} reference={} voice={} anchor={:+.3}c cost: harmonic={:.6} deviation={:.6} movement={:.6} roughness={:.6}",
             solution.score,
             crate::voice::note_name(solution.reference_note),
             solution.reference_id,
+            solution.anchor_cents,
             solution.costs.harmonic,
             solution.costs.deviation,
             solution.costs.movement,
             solution.costs.roughness
         );
+        if log::log_enabled!(log::Level::Debug) {
+            for (active, tuned) in active_notes.iter().zip(&solution.notes) {
+                let base = tuned.ratio.cents()
+                    - f64::from(i16::from(active.input_note) - i16::from(solution.reference_note))
+                        * 100.0;
+                log::debug!(
+                    "ANCHOR {} voice={} ratio={} base={:+.3}c anchor={:+.3}c actual={:+.3}c",
+                    crate::voice::note_name(active.input_note),
+                    active.id,
+                    tuned.ratio,
+                    base,
+                    solution.anchor_cents,
+                    tuned.cents_offset
+                );
+            }
+        }
         // Replace, rather than accumulate, history: released IDs never affect a new voice.
         self.previous = solution
             .notes
@@ -366,9 +513,20 @@ mod tests {
         tuned.iter().map(|note| note.ratio.to_string()).collect()
     }
 
+    fn fixed_config() -> OptimizerConfig {
+        OptimizerConfig {
+            anchor_mode: AnchorMode::Fixed,
+            ..OptimizerConfig::default()
+        }
+    }
+
+    fn fixed_optimizer() -> AdaptiveRationalOptimizer {
+        AdaptiveRationalOptimizer::new(fixed_config()).unwrap()
+    }
+
     #[test]
     fn fresh_major_triad_is_four_five_six() {
-        let mut optimizer = AdaptiveRationalOptimizer::default();
+        let mut optimizer = fixed_optimizer();
         let tuned = optimizer.tune(&notes(&[60, 64, 67]));
         assert_eq!(ratios(&tuned), ["1/1", "5/4", "3/2"]);
         for (note, expected) in tuned.iter().zip([0.0, -13.686286, 1.955001]) {
@@ -379,7 +537,7 @@ mod tests {
 
     #[test]
     fn fresh_harmonic_seventh_is_four_five_six_seven() {
-        let mut optimizer = AdaptiveRationalOptimizer::default();
+        let mut optimizer = fixed_optimizer();
         let tuned = optimizer.tune(&notes(&[60, 64, 67, 70]));
         assert_eq!(ratios(&tuned), ["1/1", "5/4", "3/2", "7/4"]);
         assert!((tuned[3].cents_offset + 31.174094).abs() < 1e-6);
@@ -387,7 +545,7 @@ mod tests {
 
     #[test]
     fn sequential_note_on_history_also_reaches_harmonic_seventh() {
-        let mut optimizer = AdaptiveRationalOptimizer::default();
+        let mut optimizer = fixed_optimizer();
         let chord = notes(&[60, 64, 67, 70]);
         for count in 1..=4 {
             let tuned = optimizer.tune(&chord[..count]);
@@ -400,7 +558,7 @@ mod tests {
 
     #[test]
     fn inversion_scores_all_pairs_without_treating_reference_as_root() {
-        let mut optimizer = AdaptiveRationalOptimizer::default();
+        let mut optimizer = fixed_optimizer();
         let tuned = optimizer.tune(&notes(&[64, 67, 72]));
         let g_over_e = tuned[1].ratio.checked_div(tuned[0].ratio).unwrap();
         let c_over_e = tuned[2].ratio.checked_div(tuned[0].ratio).unwrap();
@@ -417,7 +575,7 @@ mod tests {
 
     #[test]
     fn older_higher_voice_is_reference_even_if_input_is_unsorted() {
-        let mut optimizer = AdaptiveRationalOptimizer::default();
+        let mut optimizer = fixed_optimizer();
         let chord = [
             ActiveNote {
                 id: 8,
@@ -442,7 +600,7 @@ mod tests {
     fn movement_terms_use_voice_history_and_absolute_offsets_after_reference_change() {
         assert_eq!(movement_cost(30.0, None), 0.0);
         assert_eq!(movement_cost(20.0, Some(0.0)), 4.0);
-        let mut optimizer = AdaptiveRationalOptimizer::default();
+        let mut optimizer = fixed_optimizer();
         let chord = notes(&[60, 64, 67]);
         let old = optimizer.tune(&chord);
         let new = optimizer.tune(&chord[1..]);
@@ -464,7 +622,7 @@ mod tests {
 
     #[test]
     fn duplicate_notes_keep_independent_ids_and_new_voice_has_no_movement_cost() {
-        let mut optimizer = AdaptiveRationalOptimizer::default();
+        let mut optimizer = fixed_optimizer();
         let chord = notes(&[60, 64, 64, 67]);
         optimizer.tune(&chord[..2]);
         let tuned = optimizer.tune(&chord);
@@ -484,14 +642,17 @@ mod tests {
         reversed.reverse();
         let mut second = b.tune(&reversed);
         second.sort_by_key(|note| note.id);
-        assert_eq!(first, second);
-        assert_eq!(
-            a.last_solution().unwrap().score,
-            b.last_solution().unwrap().score
+        for (left, right) in first.iter().zip(&second) {
+            assert_eq!(left.id, right.id);
+            assert_eq!(left.ratio, right.ratio);
+            assert!((left.cents_offset - right.cents_offset).abs() < 1e-10);
+        }
+        assert!(
+            (a.last_solution().unwrap().score - b.last_solution().unwrap().score).abs() < 1e-10
         );
         let held = a.tune(&chord);
-        assert_eq!(held, first);
-        assert_eq!(a.last_solution().unwrap().costs.movement, 0.0);
+        assert_eq!(ratios(&held), ratios(&first));
+        assert!(a.last_solution().unwrap().costs.movement < 1e-8);
     }
 
     #[test]
@@ -558,13 +719,13 @@ mod tests {
     #[test]
     fn movement_weight_prevents_an_unnecessary_large_jump_on_release() {
         let chord = notes(&[60, 64, 67]);
-        let mut stable = AdaptiveRationalOptimizer::default();
+        let mut stable = fixed_optimizer();
         let mut mobile = AdaptiveRationalOptimizer::new(OptimizerConfig {
             weights: ScoreWeights {
                 movement: 0.0,
                 ..ScoreWeights::default()
             },
-            ..OptimizerConfig::default()
+            ..fixed_config()
         })
         .unwrap();
         let old = stable.tune(&chord);
@@ -590,7 +751,7 @@ mod tests {
                 roughness: 0.0,
                 ..ScoreWeights::default()
             },
-            ..OptimizerConfig::default()
+            ..fixed_config()
         };
         let mut generator = CandidateGenerator::new(config).unwrap();
         let lists: Vec<_> = [4, 7, 10]
@@ -675,7 +836,7 @@ mod tests {
                 roughness: 0.0,
                 ..ScoreWeights::default()
             },
-            ..OptimizerConfig::default()
+            ..fixed_config()
         })
         .unwrap();
         let chord = notes(&[60, 64, 67, 70]);
@@ -706,7 +867,7 @@ mod tests {
                 roughness: 0.0,
                 ..ScoreWeights::default()
             },
-            ..OptimizerConfig::default()
+            ..fixed_config()
         })
         .unwrap();
         let mut rough = AdaptiveRationalOptimizer::new(OptimizerConfig {
@@ -714,7 +875,7 @@ mod tests {
                 roughness: 200.0,
                 ..ScoreWeights::default()
             },
-            ..OptimizerConfig::default()
+            ..fixed_config()
         })
         .unwrap();
         baseline.tune(&chord);
@@ -729,5 +890,232 @@ mod tests {
         let old_roughness = roughness(&e, &model.spectrum(e_hz * 32.0 / 27.0).unwrap());
         assert!(rough.last_solution().unwrap().costs.roughness < old_roughness);
         assert!(new_choice[1].cents_offset.abs() <= 35.0);
+    }
+
+    #[test]
+    fn analytic_anchor_agrees_with_dense_grid_and_respects_bounds() {
+        let weights = ScoreWeights::default();
+        let mut stats = QuadraticStats::default();
+        for (base, old) in [
+            (0.0, Some(2.0)),
+            (15.641287, Some(1.955001)),
+            (-31.174094, None),
+        ] {
+            stats.add(base, old);
+        }
+        let bounds = AnchorBounds {
+            lower: -35.0,
+            upper: 35.0,
+        }
+        .restrict(15.641287, 35.0)
+        .unwrap()
+        .restrict(-31.174094, 35.0)
+        .unwrap();
+        let anchor = bounds.minimize(stats, weights);
+        let (a, b, c) = stats.coefficients(weights);
+        let score = |point: f64| a * point * point + b * point + c;
+        let mut grid_best = f64::INFINITY;
+        let mut point = bounds.lower;
+        while point <= bounds.upper {
+            grid_best = grid_best.min(score(point));
+            point += 0.002;
+        }
+        grid_best = grid_best.min(score(bounds.upper));
+        assert!(score(anchor) <= grid_best + 1e-7);
+        assert!(
+            (weights.deviation * stats.costs_at(anchor).0
+                + weights.movement * stats.costs_at(anchor).1
+                - score(anchor))
+            .abs()
+                < 1e-10
+        );
+        assert!(bounds.lower <= anchor && anchor <= bounds.upper);
+    }
+
+    #[test]
+    fn anchor_clamps_and_zero_quadratic_prefers_zero() {
+        let mut stats = QuadraticStats::default();
+        stats.add(0.0, Some(80.0));
+        let weights = ScoreWeights::default();
+        assert_eq!(
+            AnchorBounds {
+                lower: -5.0,
+                upper: 5.0
+            }
+            .minimize(stats, weights),
+            5.0
+        );
+        stats = QuadraticStats::default();
+        stats.add(0.0, Some(-80.0));
+        assert_eq!(
+            AnchorBounds {
+                lower: -5.0,
+                upper: 5.0
+            }
+            .minimize(stats, weights),
+            -5.0
+        );
+        let flat = ScoreWeights {
+            deviation: 0.0,
+            movement: 0.0,
+            ..weights
+        };
+        assert_eq!(
+            AnchorBounds {
+                lower: -5.0,
+                upper: 5.0
+            }
+            .minimize(stats, flat),
+            0.0
+        );
+        assert_eq!(
+            AnchorBounds {
+                lower: 2.0,
+                upper: 5.0
+            }
+            .minimize(stats, flat),
+            2.0
+        );
+        assert_eq!(
+            AnchorBounds {
+                lower: -5.0,
+                upper: -2.0
+            }
+            .minimize(stats, flat),
+            -2.0
+        );
+        assert!(
+            AnchorBounds {
+                lower: -1.0,
+                upper: 1.0
+            }
+            .restrict(5.0, 1.0)
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn floating_reference_can_have_nonzero_absolute_pitch_without_changing_ratios() {
+        let mut optimizer = AdaptiveRationalOptimizer::default();
+        let tuned = optimizer.tune(&notes(&[60, 64, 67]));
+        assert_eq!(ratios(&tuned), ["1/1", "5/4", "3/2"]);
+        let anchor = optimizer.last_solution().unwrap().anchor_cents;
+        assert!((tuned[0].cents_offset - anchor).abs() < 1e-12);
+        assert!(anchor.abs() > 0.01);
+        for (note, base) in tuned.iter().zip([
+            0.0,
+            Ratio::new(5, 4).unwrap().cents() - 400.0,
+            Ratio::new(3, 2).unwrap().cents() - 700.0,
+        ]) {
+            assert!((note.cents_offset - base - anchor).abs() < 1e-10);
+        }
+        assert!(
+            ((tuned[2].cents_offset - tuned[1].cents_offset)
+                - (Ratio::new(6, 5).unwrap().cents() - 300.0))
+                .abs()
+                < 1e-10
+        );
+    }
+
+    #[test]
+    fn floating_release_of_c_preserves_e_and_g_absolute_offsets() {
+        let chord = notes(&[60, 64, 67]);
+        let mut optimizer = AdaptiveRationalOptimizer::default();
+        for count in 1..=3 {
+            optimizer.tune(&chord[..count]);
+        }
+        let before = optimizer.last_solution().unwrap().notes.clone();
+        let after = optimizer.tune(&chord[1..]);
+        let solution = optimizer.last_solution().unwrap();
+        assert_eq!(solution.reference_id, 1);
+        assert_eq!(ratios(&after), ["1/1", "6/5"]);
+        assert!((solution.anchor_cents - before[1].cents_offset).abs() < 2.0);
+        for (old, new) in before[1..].iter().zip(&after) {
+            assert!((old.cents_offset - new.cents_offset).abs() < 2.0);
+        }
+        assert!(solution.costs.movement < 0.08);
+        assert!((after[0].cents_offset - solution.anchor_cents).abs() < 1e-12);
+    }
+
+    #[test]
+    fn floating_rebases_harmonic_seventh_without_pitch_jump() {
+        let chord = notes(&[60, 64, 67, 70]);
+        let mut optimizer = AdaptiveRationalOptimizer::default();
+        for count in 1..=4 {
+            optimizer.tune(&chord[..count]);
+        }
+        let before = optimizer.last_solution().unwrap().notes.clone();
+        assert_eq!(ratios(&before), ["1/1", "5/4", "3/2", "7/4"]);
+        let after = optimizer.tune(&chord[1..]);
+        assert_eq!(ratios(&after), ["1/1", "6/5", "7/5"]);
+        for (old, new) in before[1..].iter().zip(&after) {
+            assert!((old.cents_offset - new.cents_offset).abs() < 2.0);
+        }
+        assert!(optimizer.last_solution().unwrap().costs.movement < 0.12);
+    }
+
+    #[test]
+    fn fixed_mode_reproduces_v03_and_new_session_does_not_drift() {
+        let chord = notes(&[60, 64, 67]);
+        let mut fixed = fixed_optimizer();
+        for count in 1..=3 {
+            fixed.tune(&chord[..count]);
+        }
+        let result = fixed.tune(&chord[1..]);
+        assert_eq!(ratios(&result), ["1/1", "32/27"]);
+        assert_eq!(result[0].cents_offset, 0.0);
+        assert_eq!(fixed.last_solution().unwrap().anchor_cents, 0.0);
+
+        let mut floating = AdaptiveRationalOptimizer::default();
+        let seventh = notes(&[60, 64, 67, 70]);
+        for count in 1..=4 {
+            floating.tune(&seventh[..count]);
+        }
+        for start in 1..=4 {
+            floating.tune(&seventh[start..]);
+        }
+        assert!(floating.last_solution().is_none());
+        let fresh = floating.tune(&[ActiveNote {
+            id: 10,
+            input_note: 69,
+        }]);
+        assert_eq!(fresh[0].cents_offset, 0.0);
+        assert_eq!(floating.last_solution().unwrap().anchor_cents, 0.0);
+    }
+
+    #[test]
+    fn floating_duplicate_notes_remain_distinct_voices() {
+        let chord = notes(&[60, 64, 64, 67]);
+        let mut optimizer = AdaptiveRationalOptimizer::default();
+        for count in 1..=4 {
+            optimizer.tune(&chord[..count]);
+        }
+        let before = optimizer.last_solution().unwrap().notes.clone();
+        assert_eq!(before[1].ratio, before[2].ratio);
+        assert_ne!(before[1].id, before[2].id);
+        let after = optimizer.tune(&chord[1..]);
+        assert_eq!(after.len(), 3);
+        assert_ne!(after[0].id, after[1].id);
+        assert_eq!(after[0].ratio, after[1].ratio);
+        assert!((after[0].cents_offset - after[1].cents_offset).abs() < 1e-10);
+        assert_eq!(optimizer.previous.len(), 3);
+    }
+
+    #[test]
+    fn floating_output_stays_within_deviation_and_anchor_limits() {
+        let config = OptimizerConfig {
+            max_deviation_cents: 20.0,
+            anchor_max_cents: 5.0,
+            ..OptimizerConfig::default()
+        };
+        let mut optimizer = AdaptiveRationalOptimizer::new(config).unwrap();
+        let chord = notes(&[60, 64, 67, 72]);
+        for count in 1..=4 {
+            optimizer.tune(&chord[..count]);
+        }
+        let result = optimizer.last_solution().unwrap();
+        assert!(result.anchor_cents.is_finite() && result.anchor_cents.abs() <= 5.0 + 1e-9);
+        assert!(result.notes.iter().all(|note| note.cents_offset.is_finite()
+            && note.cents_offset.abs() <= 20.0 + 1e-8));
     }
 }

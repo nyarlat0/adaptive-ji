@@ -3,7 +3,7 @@ use adaptive_ji::{
     pitch_bend::BendRange,
     tuning::{
         AdaptiveRationalOptimizer, FiveLimitLowestRoot, OptimizerConfig, ScoreWeights,
-        TuningStrategy, roughness::RoughnessConfig,
+        TuningStrategy, adaptive::AnchorMode, roughness::RoughnessConfig,
     },
 };
 use clap::{Parser, ValueEnum};
@@ -49,13 +49,21 @@ struct Args {
     #[arg(long, default_value_t = 2048)]
     beam_width: usize,
 
+    /// Absolute tuning anchor: floating optimizes it, fixed reproduces v0.3
+    #[arg(long, value_enum, default_value = "floating")]
+    anchor_mode: AnchorMode,
+
+    /// Maximum absolute floating anchor in cents (0..=100)
+    #[arg(long, default_value_t = 35.0)]
+    anchor_max: f64,
+
     #[arg(long, default_value_t = 1.0)]
     w_harmonic: f64,
     #[arg(long, default_value_t = 0.35)]
     w_deviation: f64,
     #[arg(long, default_value_t = 1.5)]
     w_movement: f64,
-    /// Weight of cross-note synthetic partial roughness (0 restores v0.2 scoring)
+    /// Weight of cross-note roughness (0 disables it; also use fixed anchor for v0.2)
     #[arg(long, default_value_t = 20.0)]
     w_roughness: f64,
 
@@ -67,7 +75,7 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     roughness_rolloff: f64,
 
-    /// Log notes, tuning, and adaptive costs; -vv also logs ignored MIDI messages
+    /// Log notes, anchor and costs; -vv also logs base/actual offsets and ignored MIDI
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 }
@@ -92,6 +100,8 @@ fn main() -> anyhow::Result<()> {
             max_deviation_cents: args.max_deviation,
             candidates_per_note: args.candidates_per_note,
             beam_width: args.beam_width,
+            anchor_mode: args.anchor_mode,
+            anchor_max_cents: args.anchor_max,
             weights: ScoreWeights {
                 harmonic: args.w_harmonic,
                 deviation: args.w_deviation,

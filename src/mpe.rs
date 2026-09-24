@@ -175,17 +175,34 @@ mod tests {
         }
         let added = processor.process(on(70));
         assert_eq!(added.iter().filter(|msg| msg[0] & 0xf0 == 0x90).count(), 1);
-        let seventh = 1200.0 * (7.0_f64 / 4.0).log2() - 1000.0;
-        assert!(added.contains(&encode_pitch_bend(4, cents_to_pitch_bend(seventh, 2.0))));
+        let seventh = processor
+            .voices()
+            .iter()
+            .find(|voice| voice.input_note == 70)
+            .unwrap();
+        assert!(added.contains(&encode_pitch_bend(
+            4,
+            cents_to_pitch_bend(seventh.cents_offset, 2.0)
+        )));
         let removed = processor.process(off(60));
         assert!(!removed.iter().any(|msg| msg[0] & 0xf0 == 0x90));
         assert_eq!(
             removed.iter().filter(|msg| msg[0] & 0xf0 == 0xe0).count(),
             4
         );
-        assert!(removed.contains(&encode_pitch_bend(2, CENTER)));
+        let e = processor
+            .voices()
+            .iter()
+            .find(|voice| voice.input_note == 64)
+            .unwrap();
+        assert!(removed.contains(&encode_pitch_bend(
+            2,
+            cents_to_pitch_bend(e.cents_offset, 2.0)
+        )));
         assert_eq!(processor.voices()[0].input_note, 64);
-        assert_eq!(processor.voices()[0].cents_offset, 0.0);
+        let reference = &processor.voices()[0];
+        assert_eq!(reference.input_note, 64);
+        assert!(reference.cents_offset.abs() > 1.0);
     }
 
     fn on(note: u8) -> MidiEvent {
