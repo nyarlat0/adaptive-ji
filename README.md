@@ -1,7 +1,8 @@
-# adaptive-ji 0.7
+# adaptive-ji 0.9
 
 CLI-программа для Linux: принимает обычный MIDI 1.0 через `midir`/ALSA,
-подбирает контекстный 7-limit just intonation для всего аккорда с учётом
+подбирает контекстный adaptive just intonation с configurable 5/7/11
+prime limit для всего аккорда с учётом
 приближённой roughness между partials выбранного спектра и выдаёт
 MPE-подобный поток через виртуальный ALSA MIDI-порт **Adaptive JI Out**.
 GUI, аудиодвижка, JACK API и плагинов в программе нет.
@@ -43,6 +44,16 @@ aconnect -l
 диапазон может обрезать JI-коррекцию. Обычный запуск показывает только предупреждения
 и ошибки; `-v`/`--verbose` показывает NOTE ON/OFF, TUNE, reference и составляющие
 adaptive score. `-vv` дополнительно показывает debug-сообщения об игнорируемом MIDI.
+
+### Temporal movement feedback (v0.9)
+
+Movement penalty относится к фактически слышимой позиции voice: перед каждым
+retune один monotonic snapshot интерполированных pitch offsets передаётся в
+optimizer. Поэтому mid-glide событие оценивает движение от текущей высоты, а не
+от недостигнутого прошлого target. Тот же snapshot используется как начало
+нового glide; ticks только интерполируют уже выбранные targets и не запускают
+beam search повторно. Для новой ноты `current_offset_cents=None`, поэтому она
+не получает movement penalty.
 Фильтр можно переопределить переменной `RUST_LOG`.
 
 `--glide-ms 35` (default, 0..=2000) плавно перестраивает уже звучащие голоса
@@ -59,6 +70,7 @@ adaptive-ji --input "KeyRig" --strategy adaptive --anchor-mode fixed -v
 adaptive-ji --input "KeyRig" --strategy five-limit -v
 adaptive-ji --input "KeyRig" --spectrum bright -v
 adaptive-ji --input "KeyRig" --spectrum-file spectrum.toml -v
+adaptive-ji --input "KeyRig" --prime-limit 11 --max-deviation 60 -v
 ```
 
 Настройки optimizer (показаны defaults):
@@ -66,6 +78,7 @@ adaptive-ji --input "KeyRig" --spectrum-file spectrum.toml -v
 ```bash
 adaptive-ji --input "KeyRig" --strategy adaptive \
   --max-deviation 35 --candidates-per-note 8 --beam-width 2048 \
+  --prime-limit 7 \
   --anchor-mode floating --anchor-max 35 \
   --w-harmonic 1 --w-deviation 0.35 --w-movement 1.5 --w-roughness 20 \
   --roughness-partials 12 --roughness-rolloff 1.0
@@ -86,6 +99,11 @@ adaptive-ji --input "KeyRig" --strategy adaptive \
 partials, превышение выдаёт ошибку без усечения.
 Нулевые K/beam и NaN/бесконечности отклоняются до открытия MIDI-порта.
 Более широкий beam и больше candidates увеличивают время пересчёта.
+`--prime-limit` принимает только `5`, `7` (default) или `11`. 5-limit использует
+отношения из 2/3/5, 7-limit добавляет septimal 7, а 11-limit — undecimal 11.
+Более высокий предел не означает «лучше»: это только более широкое пространство
+поиска. При 11-limit можно увеличить `--candidates-per-note`, если нужен более
+широкий deterministic top-K.
 `--anchor-mode fixed` воспроизводит привязку reference к 0 cents из v0.3.
 `--w-roughness 0` исключает pairwise roughness из поиска, но оставляет выбранный
 anchor mode. Для сравнения именно с v0.2 используйте обе настройки:
@@ -180,7 +198,7 @@ E=1/1, G=6/5, C=8/5; интервал C/G=4/3. Общий anchor не меняе
 `Ratio` хранит положительные сокращённые `u64` numerator/denominator. Умножение,
 деление и масштабирование на степени двойки проверяют переполнение и выполняют
 сокращение до умножения. Для генерации перебираются степени 3: −4..4, 5: −3..3,
-7: −2..2 (315 сочетаний); степень двойки выбирается под MIDI-интервал, включая
+7: −2..2, а для 11-limit также 11: −1..1; степень двойки выбирается под MIDI-интервал, включая
 отрицательные интервалы и несколько октав.
 
 Candidates фильтруются по `abs(base_offset) <= max_deviation`, затем ранжируются по
@@ -191,7 +209,7 @@ score считают **все** пары с одинаковым весом, б�
 При default K=8 генератор сохраняет 5/4, 6/5, 3/2 и 7/4 в соответствующих
 интервалах. Roughness не используется для отсеивания относительно reference.
 
-При пустом окне используется ближайший ratio из конечного 7-limit набора с warning
+При пустом окне используется ближайший ratio из конечного выбранного prime-limit набора с warning
 один раз при генерации этого интервала. Это явно допускает выход за `max-deviation`:
 например, нулевое окно не может точно представить большинство интервалов 12-TET
 рациональными числами. При defaults fallback для MIDI-интервалов −127..127 не нужен.
@@ -215,13 +233,13 @@ score считают **все** пары с одинаковым весом, б�
 
 Deviation и movement зависят от anchor квадратично. Beam state хранит число
 voices `N`, число ранее звучавших `H`, суммы `Σbase`, `Σbase²`,
-`Σ(base−previous)` и `Σ(base−previous)²`. Для каждого partial assignment:
+`Σ(base−current)` и `Σ(base−current)²`. Для каждого partial assignment:
 
 ```text
 Q(anchor) = A*anchor² + B*anchor + C
 A = w_deviation*N/625 + w_movement*H/100
-B = 2*(w_deviation*Σbase/625 + w_movement*Σ(base−previous)/100)
-C = w_deviation*Σbase²/625 + w_movement*Σ(base−previous)²/100
+B = 2*(w_deviation*Σbase/625 + w_movement*Σ(base−current)/100)
+C = w_deviation*Σbase²/625 + w_movement*Σ(base−current)²/100
 anchor_opt = clamp(-B/(2*A), feasible_interval)   при A > 0
 ```
 
@@ -239,7 +257,7 @@ complexity(p/q) = log2(odd_num) + log2(odd_den)
 
 harmonic = sum over i < j: complexity(ratio_j / ratio_i)
 deviation = sum: ((anchor + base_offset) / 25)^2
-movement = sum over previously sounding voices: ((anchor + base_offset - previous_offset) / 10)^2
+movement = sum over sounding voices: ((anchor + base_offset - current_audible_offset) / 10)^2
 roughness = sum over i < j: R(spectrum_i, spectrum_j)
 score = w_harmonic * harmonic + w_deviation * deviation
       + w_movement * movement + w_roughness * roughness
@@ -263,6 +281,21 @@ Beam search сначала назначает reference, затем осталь
 быструю pairwise precomputation; более точный пересчёт оставлен на будущую версию.
 Сложность порядка O(beam × K × N²), плюс отбор/сортировка beam; полный K^N не перебирается.
 Beam search и отсечение candidates приближённые: глобальный минимум не гарантируется.
+
+Candidate lattice использует оси 3:`-4..4`, 5:`-3..3`, 7:`-2..2` и, только
+для 11-limit, 11:`-1..1`. Это даёт raw lattice 63, 315 и 945 комбинаций для
+5-, 7- и 11-limit. После octave normalization кандидаты фильтруются по
+`max-deviation`, сортируются по harmonic/deviation cost и сокращаются до K;
+полный Cartesian search не выполняется. Кэш разделён по `(MIDI interval,
+prime limit)`.
+
+Классический undecimal пример `11/8 = 551.318 cents`. Для tritone MIDI 60→66
+это offset примерно `-48.682 cents`, поэтому стандартный `max-deviation=35`
+намеренно его исключает. Для диагностики используйте `--max-deviation 60`.
+Для пары 60→66 roughness scan показывает profile-dependent ranking: sine даёт
+примерно `16/11=0.0154` против `11/8=0.0301`, а bright — `11/8=0.0994`
+против `16/11=0.1018`. Это следствие cross-partial model, а не специальное
+правило для undecimal ratios.
 
 Ratios по умолчанию для C–E–G–Bb, свежего и последовательного аккорда:
 
@@ -351,6 +384,8 @@ amplitudes удаляются, остальные нормируются до с
 cargo run --release --example roughness_scan -- 60 67
 cargo run --release --example roughness_scan -- 60 67 --spectrum sine
 cargo run --release --example roughness_scan -- 60 67 --spectrum bright
+cargo run --release --example ratio_scan -- 60 66 --prime-limit 7 --max-deviation 60
+cargo run --release --example ratio_scan -- 60 66 --prime-limit 11 --max-deviation 60 --spectrum bright
 cargo run --release --example spectrum_dump -- bright
 cargo run --release --example spectrum_dump -- --spectrum-file spectrum.toml
 ```
@@ -365,6 +400,11 @@ cargo run --release --example spectrum_dump -- --spectrum-file spectrum.toml
 `--strategy five-limit` выбирает простой baseline. Root —
 минимальная активная MIDI note; её отношение всегда 1/1 и коррекция 0 cents.
 Повторные экземпляры одинаковых нот участвуют независимо, с одинаковой высотой.
+
+Это не то же самое, что `--prime-limit 5`: prime limit меняет candidate lattice
+адаптивного optimizer. В 5-limit C–E–G по-прежнему может стать 4:5:6, но
+C–E–G–Bb больше не получает 7/4. В 11-limit optimizer может смешивать 3, 5,
+7 и 11 в одном assignment без распознавания названия аккорда.
 
 | Полутонов от root по модулю 12 | Ratio |
 | --- | --- |
@@ -457,8 +497,9 @@ src/
   tuning/
     mod.rs               ActiveNote, TunedNote, TuningStrategy
     rational.rs          reduced Ratio, checked arithmetic, complexity
-    candidates.rs        7-limit lattice, pruning и кэш по интервалам
-    adaptive.rs          config, Costs, floating anchor, история voices, beam search
+    candidates.rs        configurable 5/7/11-limit lattice и кэш
+    prime_limit.rs       PrimeLimit axes и raw lattice sizes
+    adaptive.rs          config, Costs, floating anchor, audible movement, beam search
     profile.rs           нормированные built-in/custom spectral profiles
     roughness.rs         абсолютные spectra и pairwise sensory roughness
     five_limit.rs        FiveLimitLowestRoot
@@ -466,6 +507,7 @@ examples/
   retune_benchmark.rs     диагностика времени пересчёта 15 voices
   glide_benchmark.rs      CPU-диагностика glide 15 voices без sleep/ALSA
   roughness_scan.rs       сравнение roughness кандидатов для двух MIDI notes
+  ratio_scan.rs            кандидаты MIDI interval по prime limit
   spectrum_dump.rs        нормированные partials выбранного профиля
 ```
 
@@ -486,6 +528,8 @@ CC и сообщения очистки, а также рациональную 
 4:5:6, 4:5:6:7, обращения, movement penalty, детерминизм и 15 voices.
 Roughness покрыта тестами спектра, нормализации, симметрии, простых интервалов,
 границ параметров, A/B E–G и влияния веса на выбор.
+Prime-limit покрыт тестами фильтрации 5/7/11, undecimal ratios, factor diagnostics,
+candidate cache, top-K pruning и выбора 11/8 optimizer-ом.
 Floating anchor проверен аналитической минимизацией против плотной сетки,
 ограничением диапазона, сохранением E/G и E/G/Bb после смены reference,
 повторными voice IDs и сбросом истории после полного отпускания нот. Fixed mode
@@ -513,7 +557,8 @@ cargo run --release --example glide_benchmark -- 10000
 ```
 
 Без жёстких timing assertions. `retune_benchmark` измеряет 15 голосов при
-sine, harmonic-default, bright и custom 32-partial профиле. Стоимость
+sine, harmonic-default, bright и custom 32-partial профиле, а также cold
+candidate generation для prime-limit 5/7/11. Стоимость
 попарной roughness примерно растёт как `partials_A × partials_B`; большой
 custom-профиль ожидаемо дороже.
 

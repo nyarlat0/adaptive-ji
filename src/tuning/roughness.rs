@@ -270,6 +270,26 @@ mod tests {
     }
 
     #[test]
+    fn eleven_limit_roughness_ranking_depends_on_spectrum_profile() {
+        let f = fundamental_frequency(60, 0.0);
+        let config = RoughnessConfig::default();
+        let sine = SpectrumModel::from_profile(
+            SpectrumProfile::builtin(SpectrumPreset::Sine, config).unwrap(),
+        );
+        let bright = SpectrumModel::from_profile(
+            SpectrumProfile::builtin(SpectrumPreset::Bright, config).unwrap(),
+        );
+        let compare = |model: &SpectrumModel, ratio: f64| {
+            roughness(
+                &model.spectrum(f).unwrap(),
+                &model.spectrum(f * ratio).unwrap(),
+            )
+        };
+        assert!(compare(&sine, 16.0 / 11.0) < compare(&sine, 11.0 / 8.0));
+        assert!(compare(&bright, 11.0 / 8.0) < compare(&bright, 16.0 / 11.0));
+    }
+
+    #[test]
     fn fractional_partial_ratios_scale_with_fundamental() {
         let profile = SpectrumProfile::new(vec![
             ProfilePartial {

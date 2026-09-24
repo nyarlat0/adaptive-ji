@@ -59,6 +59,7 @@ mod tests {
                 .map(|(id, &input_note)| ActiveNote {
                     id: id as u64,
                     input_note,
+                    current_offset_cents: None,
                 })
                 .collect::<Vec<_>>(),
         )

@@ -93,6 +93,22 @@ impl GlideEngine {
     }
 
     pub fn set_target(&mut self, id: VoiceId, target: f64, now: Duration) -> TargetUpdate {
+        let start = self
+            .voices
+            .get(&id)
+            .map(|state| state.current(now, self.config.duration()));
+        self.retarget_from(id, start, target, now)
+    }
+
+    /// Retarget from a caller-owned snapshot. This keeps tuning's movement
+    /// reference and the emitted glide start at exactly the same position.
+    pub fn retarget_from(
+        &mut self,
+        id: VoiceId,
+        start: Option<f64>,
+        target: f64,
+        now: Duration,
+    ) -> TargetUpdate {
         let bend = cents_to_pitch_bend(target, self.range_semitones);
         let Some(state) = self.voices.get_mut(&id) else {
             self.voices.insert(
@@ -118,7 +134,7 @@ impl GlideEngine {
         if state.target_cents == target {
             return TargetUpdate::Unchanged;
         }
-        let from_cents = state.current(now, self.config.duration());
+        let from_cents = start.unwrap_or_else(|| state.current(now, self.config.duration()));
         state.start_cents = from_cents;
         state.target_cents = target;
         state.start_at = now;
@@ -135,6 +151,22 @@ impl GlideEngine {
             from_cents,
             to_cents: target,
         }
+    }
+
+    /// Return the interpolated audible position at a supplied monotonic time.
+    pub fn current_offset_at(&self, id: VoiceId, now: Duration) -> Option<f64> {
+        self.voices
+            .get(&id)
+            .map(|state| state.current(now, self.config.duration()))
+    }
+
+    pub fn snapshot_at<I>(&self, ids: I, now: Duration) -> BTreeMap<VoiceId, f64>
+    where
+        I: IntoIterator<Item = VoiceId>,
+    {
+        ids.into_iter()
+            .filter_map(|id| self.current_offset_at(id, now).map(|offset| (id, offset)))
+            .collect()
     }
 
     pub fn remove(&mut self, id: VoiceId) {
@@ -228,6 +260,22 @@ mod tests {
         );
         assert!((engine.voices[&1].current(ms(20), ms(40)) - 10.0).abs() < 1e-9);
         assert!((engine.voices[&1].current(ms(40), ms(40)) + 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn current_offset_snapshot_is_explicit_and_deterministic() {
+        let mut engine = GlideEngine::new(
+            GlideConfig {
+                duration_ms: 100,
+                tick_ms: 5,
+            },
+            2.0,
+        );
+        engine.set_target(1, 0.0, ms(0));
+        engine.set_target(1, -20.0, ms(0));
+        assert_eq!(engine.current_offset_at(1, ms(25)), Some(-5.0));
+        let snapshot = engine.snapshot_at([1], ms(25));
+        assert_eq!(snapshot.get(&1), Some(&-5.0));
     }
 
     #[test]

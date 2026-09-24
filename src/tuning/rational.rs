@@ -1,5 +1,7 @@
 //! Positive, reduced rational intervals. Arithmetic checks overflow after cancellation.
 
+use std::collections::BTreeMap;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Ratio {
     num: u64,
@@ -92,6 +94,31 @@ pub fn harmonic_complexity(ratio: Ratio) -> f64 {
     (num as f64).log2() + (den as f64).log2()
 }
 
+/// Prime exponents of the odd part: numerator exponents are positive and
+/// denominator exponents are negative. Powers of two are deliberately absent.
+pub fn prime_factorization_without_two(ratio: Ratio) -> BTreeMap<u64, i32> {
+    fn add_factors(mut value: u64, sign: i32, factors: &mut BTreeMap<u64, i32>) {
+        value >>= value.trailing_zeros();
+        let mut prime = 3_u64;
+        while prime <= value / prime {
+            while value.is_multiple_of(prime) {
+                *factors.entry(prime).or_default() += sign;
+                value /= prime;
+            }
+            prime += 2;
+        }
+        if value > 1 {
+            *factors.entry(value).or_default() += sign;
+        }
+    }
+
+    let mut factors = BTreeMap::new();
+    add_factors(ratio.numerator(), 1, &mut factors);
+    add_factors(ratio.denominator(), -1, &mut factors);
+    factors.retain(|_, exponent| *exponent != 0);
+    factors
+}
+
 impl std::fmt::Display for Ratio {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.num, self.den)
@@ -150,5 +177,20 @@ mod tests {
             assert!((harmonic_complexity(ratio) - expected).abs() < 1e-12);
             assert!((harmonic_complexity(ratio.scale_pow2(-3).unwrap()) - expected).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn undecimal_ratios_reduce_have_expected_cents_complexity_and_factors() {
+        for (num, den, cents, factors) in [
+            (11, 8, 551.318, [(11, 1)].into_iter().collect()),
+            (11, 7, 782.492, [(7, -1), (11, 1)].into_iter().collect()),
+            (14, 11, 417.508, [(7, 1), (11, -1)].into_iter().collect()),
+            (20, 11, 1034.996, [(5, 1), (11, -1)].into_iter().collect()),
+        ] {
+            let ratio = Ratio::new(num, den).unwrap();
+            assert!((ratio.cents() - cents).abs() < 1.0);
+            assert_eq!(prime_factorization_without_two(ratio), factors);
+        }
+        assert!((harmonic_complexity(Ratio::new(11, 8).unwrap()) - 11_f64.log2()).abs() < 1e-12);
     }
 }

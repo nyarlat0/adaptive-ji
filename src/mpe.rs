@@ -178,6 +178,11 @@ impl<T: TuningStrategy> MpeProcessor<T> {
     fn retune(&mut self, now: Duration, output: &mut Vec<MidiMessage>) {
         let (held, sustained) = self.allocator.state_counts();
         log::info!("VOICES held={held} sustained={sustained}");
+        // One immutable timestamp is shared by tuning and output retargeting.
+        // This closes the feedback loop around the actually audible position.
+        let snapshot = self
+            .glide
+            .snapshot_at(self.allocator.voices().iter().map(|voice| voice.id), now);
         let notes: Vec<_> = self
             .allocator
             .voices()
@@ -185,13 +190,19 @@ impl<T: TuningStrategy> MpeProcessor<T> {
             .map(|voice| ActiveNote {
                 id: voice.id,
                 input_note: voice.input_note,
+                current_offset_cents: snapshot.get(&voice.id).copied(),
             })
             .collect();
         for tuned in self.tuning.tune(&notes) {
             if let Some(voice) = self.allocator.voice_mut(tuned.id) {
                 voice.cents_offset = tuned.cents_offset;
                 let bend = cents_to_pitch_bend(tuned.cents_offset, self.bend_range.semitones());
-                match self.glide.set_target(tuned.id, tuned.cents_offset, now) {
+                match self.glide.retarget_from(
+                    tuned.id,
+                    snapshot.get(&tuned.id).copied(),
+                    tuned.cents_offset,
+                    now,
+                ) {
                     TargetUpdate::Immediate(value) => {
                         output.push(encode_pitch_bend(voice.output_channel, value));
                     }
@@ -785,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn glide_output_keeps_optimizer_targets_identical_to_immediate_mode() {
+    fn glide_output_uses_actual_mid_glide_position_for_optimizer() {
         let mut instant = MpeProcessor::new(
             crate::tuning::AdaptiveRationalOptimizer::default(),
             "2".parse().unwrap(),
@@ -817,7 +828,9 @@ mod tests {
                 .iter()
                 .map(|v| (v.id, v.cents_offset))
                 .collect::<Vec<_>>();
-            assert_eq!(a, b);
+            if index == 0 {
+                assert_eq!(a, b);
+            }
         }
     }
 

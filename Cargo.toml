@@ -1,8 +1,8 @@
 [package]
 name = "adaptive-ji"
-version = "0.7.0"
+version = "0.9.0"
 edition = "2024"
-description = "Linux MIDI processor for spectral-profile-aware adaptive just intonation"
+description = "Linux MIDI processor with configurable 5/7/11-limit adaptive just intonation"
 
 [dependencies]
 anyhow = "1"

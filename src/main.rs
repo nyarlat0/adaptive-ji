@@ -5,7 +5,7 @@ use adaptive_ji::{
     midi,
     pitch_bend::BendRange,
     tuning::{
-        AdaptiveRationalOptimizer, FiveLimitLowestRoot, OptimizerConfig, ScoreWeights,
+        AdaptiveRationalOptimizer, FiveLimitLowestRoot, OptimizerConfig, PrimeLimit, ScoreWeights,
         TuningStrategy,
         adaptive::AnchorMode,
         profile::{SpectrumPreset, SpectrumProfile},
@@ -42,6 +42,10 @@ struct Args {
     /// Tuning strategy (five-limit preserves the v0.1 lowest-root baseline)
     #[arg(long, value_enum, default_value = "adaptive")]
     strategy: Strategy,
+
+    /// Rational candidate prime limit (5, 7, or 11)
+    #[arg(long, value_enum, default_value = "7")]
+    prime_limit: PrimeLimit,
 
     /// Candidate window around 12-TET, in cents (0..=100)
     #[arg(long, default_value_t = 35.0)]
@@ -145,7 +149,13 @@ fn main() -> anyhow::Result<()> {
                 profile.partials().len()
             );
         }
+        log::info!(
+            "PRIME LIMIT {} raw_lattice={}",
+            args.prime_limit.as_str(),
+            args.prime_limit.raw_lattice_size()
+        );
         let config = OptimizerConfig {
+            prime_limit: args.prime_limit,
             max_deviation_cents: args.max_deviation,
             candidates_per_note: args.candidates_per_note,
             beam_width: args.beam_width,

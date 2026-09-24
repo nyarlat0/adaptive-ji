@@ -5,7 +5,8 @@ use std::{
 };
 
 use adaptive_ji::tuning::{
-    ActiveNote, AdaptiveRationalOptimizer, OptimizerConfig, TuningStrategy,
+    ActiveNote, AdaptiveRationalOptimizer, OptimizerConfig, PrimeLimit, TuningStrategy,
+    candidates::CandidateGenerator,
     profile::{ProfilePartial, SpectrumPreset, SpectrumProfile},
 };
 
@@ -77,8 +78,28 @@ fn main() {
         .map(|(id, &input_note)| ActiveNote {
             id: id as u64,
             input_note,
+            current_offset_cents: None,
         })
         .collect();
+    for prime_limit in [PrimeLimit::Five, PrimeLimit::Seven, PrimeLimit::Eleven] {
+        let started = Instant::now();
+        let mut generator = CandidateGenerator::new(OptimizerConfig {
+            prime_limit,
+            ..OptimizerConfig::default()
+        })
+        .unwrap();
+        let mut count = 0;
+        for interval in -127..=127 {
+            count += generator.for_interval(interval).candidates.len();
+        }
+        println!(
+            "candidate generation prime-limit={} raw={} : {:.3} ms ({} candidates)",
+            prime_limit.as_str(),
+            prime_limit.raw_lattice_size(),
+            started.elapsed().as_secs_f64() * 1000.0,
+            count
+        );
+    }
     println!("15 voices; K=8, beam=2048; construction/logging/MIDI excluded");
     let config = OptimizerConfig::default();
     for (name, preset) in [
