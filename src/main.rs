@@ -43,9 +43,13 @@ struct Args {
     #[arg(long, value_enum, default_value = "adaptive")]
     strategy: Strategy,
 
-    /// Rational candidate prime limit (5, 7, or 11)
-    #[arg(long, value_enum, default_value = "7")]
+    /// Rational candidate prime limit (any prime 3..=997)
+    #[arg(long, default_value = "7")]
     prime_limit: PrimeLimit,
+
+    /// Modified Tenney complexity budget for bounded candidate search
+    #[arg(long, default_value_t = 12.0)]
+    max_complexity: f64,
 
     /// Candidate window around 12-TET, in cents (0..=100)
     #[arg(long, default_value_t = 35.0)]
@@ -150,13 +154,15 @@ fn main() -> anyhow::Result<()> {
             );
         }
         log::info!(
-            "PRIME LIMIT {} raw_lattice={}",
-            args.prime_limit.as_str(),
-            args.prime_limit.raw_lattice_size()
+            "PRIME LIMIT {} effective_primes={} max_complexity={}",
+            args.prime_limit.max_prime(),
+            args.prime_limit.effective_primes(args.max_complexity).len(),
+            args.max_complexity
         );
         let config = OptimizerConfig {
             prime_limit: args.prime_limit,
             max_deviation_cents: args.max_deviation,
+            max_complexity: args.max_complexity,
             candidates_per_note: args.candidates_per_note,
             beam_width: args.beam_width,
             anchor_mode: args.anchor_mode,

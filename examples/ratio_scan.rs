@@ -26,21 +26,14 @@ fn main() {
             .next()
             .expect("usage: ratio_scan MIDI_A MIDI_B [options]"),
     );
-    let mut prime_limit = PrimeLimit::Seven;
+    let mut prime_limit = PrimeLimit::new(7).unwrap();
     let mut max_deviation = 35.0;
     let mut preset = SpectrumPreset::Harmonic;
     let mut spectrum_file = None;
     while let Some(option) = args.next() {
         let value = args.next().expect("option requires a value");
         match option.as_str() {
-            "--prime-limit" => {
-                prime_limit = match value.as_str() {
-                    "5" => PrimeLimit::Five,
-                    "7" => PrimeLimit::Seven,
-                    "11" => PrimeLimit::Eleven,
-                    _ => panic!("prime limit must be 5, 7, or 11"),
-                }
-            }
+            "--prime-limit" => prime_limit = value.parse().expect("prime limit must be prime"),
             "--max-deviation" => max_deviation = value.parse().expect("max deviation cents"),
             "--spectrum" => {
                 preset = SpectrumPreset::from_str(&value, true).expect("unknown spectrum")
@@ -61,21 +54,30 @@ fn main() {
     );
     let model = SpectrumModel::from_profile(profile);
     let mut generator = CandidateGenerator::new(config).unwrap();
-    let candidates = generator.for_interval(i16::from(second) - i16::from(first));
+    let candidates = generator
+        .for_interval(i16::from(second) - i16::from(first))
+        .clone();
     let reference = model.spectrum(fundamental_frequency(first, 0.0)).unwrap();
     println!(
         "MIDI {first}->{second}, prime-limit={}, max-deviation={}c",
-        prime_limit.as_str(),
+        prime_limit.max_prime(),
         max_deviation
     );
-    println!("ratio       cents       offset      complexity  roughness");
+    println!(
+        "effective primes: {:?}, visited search nodes: {}, generated candidates: {}",
+        generator.effective_primes(),
+        generator.visited_search_nodes,
+        candidates.generated_count
+    );
+    println!("ratio       factors             cents       offset      complexity  roughness");
     for candidate in &candidates.candidates {
         let spectrum = model
             .spectrum(fundamental_frequency(second, candidate.offset_cents))
             .unwrap();
         println!(
-            "{:<11} {:+10.3} {:+10.3} {:11.4} {:10.6}",
+            "{:<11} {:<19?} {:+10.3} {:+10.3} {:11.4} {:10.6}",
             candidate.ratio,
+            adaptive_ji::tuning::rational::prime_factorization_without_two(candidate.ratio),
             candidate.ratio.cents(),
             candidate.offset_cents,
             harmonic_complexity(candidate.ratio),

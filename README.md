@@ -1,7 +1,7 @@
-# adaptive-ji 0.9
+# adaptive-ji 0.95
 
 CLI-программа для Linux: принимает обычный MIDI 1.0 через `midir`/ALSA,
-подбирает контекстный adaptive just intonation с configurable 5/7/11
+подбирает контекстный adaptive just intonation с configurable arbitrary
 prime limit для всего аккорда с учётом
 приближённой roughness между partials выбранного спектра и выдаёт
 MPE-подобный поток через виртуальный ALSA MIDI-порт **Adaptive JI Out**.
@@ -79,6 +79,7 @@ adaptive-ji --input "KeyRig" --prime-limit 11 --max-deviation 60 -v
 adaptive-ji --input "KeyRig" --strategy adaptive \
   --max-deviation 35 --candidates-per-note 8 --beam-width 2048 \
   --prime-limit 7 \
+  --max-complexity 12 \
   --anchor-mode floating --anchor-max 35 \
   --w-harmonic 1 --w-deviation 0.35 --w-movement 1.5 --w-roughness 20 \
   --roughness-partials 12 --roughness-rolloff 1.0
@@ -99,11 +100,13 @@ adaptive-ji --input "KeyRig" --strategy adaptive \
 partials, превышение выдаёт ошибку без усечения.
 Нулевые K/beam и NaN/бесконечности отклоняются до открытия MIDI-порта.
 Более широкий beam и больше candidates увеличивают время пересчёта.
-`--prime-limit` принимает только `5`, `7` (default) или `11`. 5-limit использует
-отношения из 2/3/5, 7-limit добавляет septimal 7, а 11-limit — undecimal 11.
-Более высокий предел не означает «лучше»: это только более широкое пространство
-поиска. При 11-limit можно увеличить `--candidates-per-note`, если нужен более
-широкий deterministic top-K.
+`--prime-limit` принимает любой простой предел от 3 до 997 (default 7):
+p-limit разрешает все простые множители `<= p`. 5-limit использует 2/3/5,
+7-limit добавляет septimal 7, 11-limit — undecimal 11, а 13/17 и выше
+расширяют пространство аналогично. Более высокий предел не означает «лучше».
+Кандидаты ищутся bounded best-first поиском по modified Tenney complexity;
+полного Cartesian произведения exponent axes нет. `--max-complexity` (default
+12) задаёт budget этого поиска.
 `--anchor-mode fixed` воспроизводит привязку reference к 0 cents из v0.3.
 `--w-roughness 0` исключает pairwise roughness из поиска, но оставляет выбранный
 anchor mode. Для сравнения именно с v0.2 используйте обе настройки:
@@ -282,12 +285,15 @@ Beam search сначала назначает reference, затем осталь
 Сложность порядка O(beam × K × N²), плюс отбор/сортировка beam; полный K^N не перебирается.
 Beam search и отсечение candidates приближённые: глобальный минимум не гарантируется.
 
-Candidate lattice использует оси 3:`-4..4`, 5:`-3..3`, 7:`-2..2` и, только
-для 11-limit, 11:`-1..1`. Это даёт raw lattice 63, 315 и 945 комбинаций для
-5-, 7- и 11-limit. После octave normalization кандидаты фильтруются по
+Candidate generator выполняет bounded best-first expansion odd-prime ratios.
+Каждый ненулевой exponent увеличивает modified Tenney complexity, поэтому
+при finite `max-complexity` очередь конечна; branches выше budget не
+расширяются. После octave normalization кандидаты фильтруются по
 `max-deviation`, сортируются по harmonic/deviation cost и сокращаются до K;
 полный Cartesian search не выполняется. Кэш разделён по `(MIDI interval,
-prime limit)`.
+prime limit, max-complexity)`. Внутренний защитный cap поиска — 50 000
+посещённых ratio states на profile; diagnostics `ratio_scan` показывает размер
+полученного bounded pool.
 
 Классический undecimal пример `11/8 = 551.318 cents`. Для tritone MIDI 60→66
 это offset примерно `-48.682 cents`, поэтому стандартный `max-deviation=35`
@@ -386,6 +392,7 @@ cargo run --release --example roughness_scan -- 60 67 --spectrum sine
 cargo run --release --example roughness_scan -- 60 67 --spectrum bright
 cargo run --release --example ratio_scan -- 60 66 --prime-limit 7 --max-deviation 60
 cargo run --release --example ratio_scan -- 60 66 --prime-limit 11 --max-deviation 60 --spectrum bright
+cargo run --release --example ratio_scan -- 60 66 --prime-limit 13 --max-deviation 60
 cargo run --release --example spectrum_dump -- bright
 cargo run --release --example spectrum_dump -- --spectrum-file spectrum.toml
 ```
@@ -497,8 +504,8 @@ src/
   tuning/
     mod.rs               ActiveNote, TunedNote, TuningStrategy
     rational.rs          reduced Ratio, checked arithmetic, complexity
-    candidates.rs        configurable 5/7/11-limit lattice и кэш
-    prime_limit.rs       PrimeLimit axes и raw lattice sizes
+    candidates.rs        bounded arbitrary-prime search и кэш
+    prime_limit.rs       PrimeLimit validation и effective prime set
     adaptive.rs          config, Costs, floating anchor, audible movement, beam search
     profile.rs           нормированные built-in/custom spectral profiles
     roughness.rs         абсолютные spectra и pairwise sensory roughness
@@ -528,8 +535,9 @@ CC и сообщения очистки, а также рациональную 
 4:5:6, 4:5:6:7, обращения, movement penalty, детерминизм и 15 voices.
 Roughness покрыта тестами спектра, нормализации, симметрии, простых интервалов,
 границ параметров, A/B E–G и влияния веса на выбор.
-Prime-limit покрыт тестами фильтрации 5/7/11, undecimal ratios, factor diagnostics,
-candidate cache, top-K pruning и выбора 11/8 optimizer-ом.
+Prime-limit покрыт тестами generic validation, фильтрации 5/7/11, новых 13/17/19
+ratios, factor diagnostics, complexity-bounded search, candidate cache, top-K
+pruning и выбора 11/8 optimizer-ом.
 Floating anchor проверен аналитической минимизацией против плотной сетки,
 ограничением диапазона, сохранением E/G и E/G/Bb после смены reference,
 повторными voice IDs и сбросом истории после полного отпускания нот. Fixed mode
@@ -558,7 +566,7 @@ cargo run --release --example glide_benchmark -- 10000
 
 Без жёстких timing assertions. `retune_benchmark` измеряет 15 голосов при
 sine, harmonic-default, bright и custom 32-partial профиле, а также cold
-candidate generation для prime-limit 5/7/11. Стоимость
+candidate generation для prime-limit 3/5/7/11/13/17/23/31/101. Стоимость
 попарной roughness примерно растёт как `partials_A × partials_B`; большой
 custom-профиль ожидаемо дороже.
 

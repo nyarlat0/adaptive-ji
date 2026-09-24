@@ -81,7 +81,17 @@ fn main() {
             current_offset_cents: None,
         })
         .collect();
-    for prime_limit in [PrimeLimit::Five, PrimeLimit::Seven, PrimeLimit::Eleven] {
+    for prime_limit in [
+        PrimeLimit::new(3).unwrap(),
+        PrimeLimit::new(5).unwrap(),
+        PrimeLimit::new(7).unwrap(),
+        PrimeLimit::new(11).unwrap(),
+        PrimeLimit::new(13).unwrap(),
+        PrimeLimit::new(17).unwrap(),
+        PrimeLimit::new(23).unwrap(),
+        PrimeLimit::new(31).unwrap(),
+        PrimeLimit::new(101).unwrap(),
+    ] {
         let started = Instant::now();
         let mut generator = CandidateGenerator::new(OptimizerConfig {
             prime_limit,
@@ -94,8 +104,8 @@ fn main() {
         }
         println!(
             "candidate generation prime-limit={} raw={} : {:.3} ms ({} candidates)",
-            prime_limit.as_str(),
-            prime_limit.raw_lattice_size(),
+            prime_limit.max_prime(),
+            prime_limit.effective_primes(12.0).len(),
             started.elapsed().as_secs_f64() * 1000.0,
             count
         );

@@ -40,6 +40,7 @@ impl Default for ScoreWeights {
 #[derive(Clone, Copy, Debug)]
 pub struct OptimizerConfig {
     pub prime_limit: PrimeLimit,
+    pub max_complexity: f64,
     pub max_deviation_cents: f64,
     pub candidates_per_note: usize,
     pub beam_width: usize,
@@ -52,7 +53,8 @@ pub struct OptimizerConfig {
 impl Default for OptimizerConfig {
     fn default() -> Self {
         Self {
-            prime_limit: PrimeLimit::Seven,
+            prime_limit: PrimeLimit::default(),
+            max_complexity: 12.0,
             max_deviation_cents: 35.0,
             candidates_per_note: 8,
             beam_width: 2048,
@@ -74,6 +76,9 @@ impl OptimizerConfig {
             || !(0.0..=100.0).contains(&self.max_deviation_cents)
         {
             return Err("max-deviation must be finite and in 0..=100 cents".into());
+        }
+        if !self.max_complexity.is_finite() || !(0.1..=64.0).contains(&self.max_complexity) {
+            return Err("max-complexity must be finite and in 0.1..=64".into());
         }
         if !(1..=32).contains(&self.candidates_per_note) {
             return Err("candidates-per-note must be in 1..=32".into());
@@ -543,7 +548,7 @@ mod tests {
     #[test]
     fn prime_limit_five_keeps_triad_but_forbids_septimal_seventh() {
         let mut config = fixed_config();
-        config.prime_limit = PrimeLimit::Five;
+        config.prime_limit = PrimeLimit::new(5).unwrap();
         let mut optimizer = AdaptiveRationalOptimizer::new(config).unwrap();
         let triad = optimizer.tune(&notes(&[60, 64, 67]));
         assert_eq!(ratios(&triad), ["1/1", "5/4", "3/2"]);
@@ -563,7 +568,7 @@ mod tests {
     #[test]
     fn prime_limit_eleven_can_select_undecimal_tritone_when_complexity_dominates() {
         let mut config = fixed_config();
-        config.prime_limit = PrimeLimit::Eleven;
+        config.prime_limit = PrimeLimit::new(11).unwrap();
         config.max_deviation_cents = 60.0;
         config.weights.harmonic = 10.0;
         config.weights.deviation = 0.0;

@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
+};
 
 use super::{
     Ratio, adaptive::OptimizerConfig, prime_limit::PrimeLimit, rational::harmonic_complexity,
@@ -13,48 +16,62 @@ pub struct Candidate {
 #[derive(Clone, Debug)]
 pub struct CandidateSet {
     pub candidates: Vec<Candidate>,
+    pub generated_count: usize,
     /// A finite prime-limited lattice cannot meet arbitrarily narrow windows for every interval.
     pub used_fallback: bool,
 }
 
+type CandidateCacheKey = (i16, PrimeLimit, u64, u64, usize, u64, u64);
+
 pub struct CandidateGenerator {
     config: OptimizerConfig,
-    octave_pool: Vec<Ratio>,
-    cache: BTreeMap<(i16, PrimeLimit, u64, usize, u64, u64), CandidateSet>,
+    odd_pool: Vec<Ratio>,
+    cache: BTreeMap<CandidateCacheKey, CandidateSet>,
+    pub visited_search_nodes: usize,
 }
 
 impl CandidateGenerator {
     pub fn new(config: OptimizerConfig) -> Result<Self, String> {
         config.validate()?;
-        let limit = config.prime_limit;
-        let mut octave_pool = Vec::with_capacity(limit.raw_lattice_size());
-        let axes = limit.axes();
-        let mut exponents = vec![0_i32; axes.len()];
-        generate_lattice(axes, 0, &mut exponents, &mut octave_pool);
-        octave_pool.sort_unstable();
-        octave_pool.dedup();
+        let odd_pool = bounded_odd_ratios(config.prime_limit, config.max_complexity);
+        let visited_search_nodes = odd_pool.len();
         Ok(Self {
             config,
-            octave_pool,
+            odd_pool,
             cache: BTreeMap::new(),
+            visited_search_nodes,
         })
+    }
+
+    pub fn effective_primes(&self) -> Vec<u32> {
+        self.config
+            .prime_limit
+            .effective_primes(self.config.max_complexity)
+    }
+
+    pub fn generated_candidates(&self, interval: i16) -> Option<usize> {
+        self.cache
+            .iter()
+            .find(|((cached_interval, ..), _)| *cached_interval == interval)
+            .map(|(_, set)| set.generated_count)
     }
 
     /// MIDI intervals are -127..=127. Cache makes unchanged-reference retunes cheap.
     pub fn for_interval(&mut self, interval: i16) -> &CandidateSet {
         let config = &self.config;
-        let pool = &self.octave_pool;
         let key = (
             interval,
             config.prime_limit,
             config.max_deviation_cents.to_bits(),
+            config.max_complexity.to_bits(),
             config.candidates_per_note,
             config.weights.harmonic.to_bits(),
             config.weights.deviation.to_bits(),
         );
         self.cache.entry(key).or_insert_with(|| {
             let target = f64::from(interval) * 100.0;
-            let mut all: Vec<_> = pool
+            let mut all: Vec<_> = self
+                .odd_pool
                 .iter()
                 .filter_map(|&ratio| {
                     let octave = ((target - ratio.cents()) / 1200.0).round() as i32;
@@ -105,40 +122,84 @@ impl CandidateGenerator {
                     .then_with(|| a.offset_cents.abs().total_cmp(&b.offset_cents.abs()))
                     .then_with(|| a.ratio.cmp(&b.ratio))
             });
+            let generated_count = all.len();
             all.truncate(config.candidates_per_note);
             CandidateSet {
                 candidates: all,
+                generated_count,
                 used_fallback,
             }
         })
     }
 }
 
-fn generate_lattice(
-    axes: &[(u64, i32)],
-    axis: usize,
-    exponents: &mut [i32],
-    pool: &mut Vec<Ratio>,
-) {
-    if axis == axes.len() {
-        let (mut num, mut den) = (1_u64, 1_u64);
-        for ((prime, _), &exponent) in axes.iter().zip(exponents.iter()) {
-            if exponent >= 0 {
-                num *= prime.pow(exponent as u32);
-            } else {
-                den *= prime.pow(exponent.unsigned_abs());
+#[derive(Clone, Copy, Debug)]
+struct SearchState {
+    ratio: Ratio,
+    complexity: f64,
+}
+
+impl PartialEq for SearchState {
+    fn eq(&self, other: &Self) -> bool {
+        self.ratio == other.ratio
+    }
+}
+impl Eq for SearchState {}
+impl Ord for SearchState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .complexity
+            .total_cmp(&self.complexity)
+            .then_with(|| other.ratio.cmp(&self.ratio))
+    }
+}
+impl PartialOrd for SearchState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Best-first expansion by Tenney lower bound. Each expansion changes one
+/// prime exponent by ±1; complexity strictly grows, so the queue is finite.
+fn bounded_odd_ratios(limit: PrimeLimit, budget: f64) -> Vec<Ratio> {
+    let primes = limit.effective_primes(budget);
+    let mut queue = BinaryHeap::from([SearchState {
+        ratio: Ratio::ONE,
+        complexity: 0.0,
+    }]);
+    let mut seen = BTreeSet::from([Ratio::ONE]);
+    let mut output = Vec::new();
+    let node_cap = 50_000usize;
+    while let Some(state) = queue.pop() {
+        if state.complexity > budget + 1e-9 {
+            continue;
+        }
+        output.push(state.ratio);
+        if output.len() >= node_cap {
+            break;
+        }
+        for &prime in &primes {
+            let factor = Ratio::new(u64::from(prime), 1).expect("prime");
+            for neighbor in [
+                state.ratio.checked_mul(factor),
+                state.ratio.checked_div(factor),
+            ] {
+                let Some(neighbor) = neighbor else { continue };
+                if !seen.insert(neighbor) {
+                    continue;
+                }
+                let complexity = harmonic_complexity(neighbor);
+                if complexity <= budget + 1e-9 {
+                    queue.push(SearchState {
+                        ratio: neighbor,
+                        complexity,
+                    });
+                }
             }
         }
-        let ratio = Ratio::new(num, den).expect("positive bounded prime powers");
-        let octave = (ratio.cents() / 1200.0).floor() as i32;
-        pool.push(ratio.scale_pow2(-octave).expect("bounded octave ratio"));
-        return;
     }
-    let (_, bound) = axes[axis];
-    for exponent in -bound..=bound {
-        exponents[axis] = exponent;
-        generate_lattice(axes, axis + 1, exponents, pool);
-    }
+    output.sort_unstable();
+    output
 }
 
 #[cfg(test)]
@@ -222,9 +283,9 @@ mod tests {
 
     #[test]
     fn prime_limits_filter_lattice_axes() {
-        let mut five = make_generator(PrimeLimit::Five, 60.0);
-        let mut seven = make_generator(PrimeLimit::Seven, 60.0);
-        let mut eleven = make_generator(PrimeLimit::Eleven, 60.0);
+        let mut five = make_generator(PrimeLimit::new(5).unwrap(), 60.0);
+        let mut seven = make_generator(PrimeLimit::new(7).unwrap(), 60.0);
+        let mut eleven = make_generator(PrimeLimit::new(11).unwrap(), 60.0);
         let fifth = five.for_interval(6).candidates.clone();
         assert!(!fifth.iter().any(|c| c.ratio == Ratio::new(11, 8).unwrap()));
         assert!(!fifth.iter().any(|c| c.ratio == Ratio::new(7, 4).unwrap()));
@@ -248,7 +309,7 @@ mod tests {
                 .any(|c| c.ratio == Ratio::new(11, 8).unwrap())
         );
         for interval in -24..=24 {
-            for candidate in &make_generator(PrimeLimit::Five, 60.0)
+            for candidate in &make_generator(PrimeLimit::new(5).unwrap(), 60.0)
                 .for_interval(interval)
                 .candidates
                 .clone()
@@ -264,7 +325,7 @@ mod tests {
 
     #[test]
     fn undecimal_tritone_candidate_requires_wide_window_and_is_deterministic() {
-        let mut narrow = make_generator(PrimeLimit::Eleven, 35.0);
+        let mut narrow = make_generator(PrimeLimit::new(11).unwrap(), 35.0);
         assert!(
             !narrow
                 .for_interval(6)
@@ -272,7 +333,7 @@ mod tests {
                 .iter()
                 .any(|c| c.ratio == Ratio::new(11, 8).unwrap())
         );
-        let mut wide = make_generator(PrimeLimit::Eleven, 60.0);
+        let mut wide = make_generator(PrimeLimit::new(11).unwrap(), 60.0);
         let first = wide.for_interval(6).candidates.clone();
         assert!(first.iter().any(|c| {
             c.ratio == Ratio::new(11, 8).unwrap() && (c.offset_cents + 48.6820576).abs() < 1e-5
@@ -281,7 +342,7 @@ mod tests {
         assert_eq!(first, second);
 
         let mut default_k = CandidateGenerator::new(OptimizerConfig {
-            prime_limit: PrimeLimit::Eleven,
+            prime_limit: PrimeLimit::new(11).unwrap(),
             max_deviation_cents: 60.0,
             ..OptimizerConfig::default()
         })
@@ -297,11 +358,11 @@ mod tests {
 
     #[test]
     fn cache_key_includes_prime_limit() {
-        let mut generator = make_generator(PrimeLimit::Seven, 60.0);
+        let mut generator = make_generator(PrimeLimit::new(7).unwrap(), 60.0);
         let seven = generator.for_interval(6).candidates.clone();
         assert!(!seven.iter().any(|c| c.ratio == Ratio::new(11, 8).unwrap()));
         // A separate generator has a separate lattice/cache and must expose 11/8.
-        let mut eleven = make_generator(PrimeLimit::Eleven, 60.0);
+        let mut eleven = make_generator(PrimeLimit::new(11).unwrap(), 60.0);
         assert!(
             eleven
                 .for_interval(6)
@@ -313,7 +374,7 @@ mod tests {
 
     #[test]
     fn characteristic_undecimal_ratios_are_reachable_with_wide_window() {
-        let mut generator = make_generator(PrimeLimit::Eleven, 60.0);
+        let mut generator = make_generator(PrimeLimit::new(11).unwrap(), 60.0);
         for (interval, ratio) in [
             (6, Ratio::new(11, 8).unwrap()),
             (8, Ratio::new(11, 7).unwrap()),
@@ -327,6 +388,25 @@ mod tests {
                     .iter()
                     .any(|candidate| candidate.ratio == ratio),
                 "missing {ratio} at interval {interval}"
+            );
+        }
+    }
+
+    #[test]
+    fn arbitrary_prime_limits_reach_new_prime_factors() {
+        for (limit, interval, ratio) in [
+            (13, 8, Ratio::new(13, 8).unwrap()),
+            (17, 1, Ratio::new(17, 16).unwrap()),
+            (19, 3, Ratio::new(19, 16).unwrap()),
+        ] {
+            let mut generator = make_generator(PrimeLimit::new(limit).unwrap(), 60.0);
+            assert!(
+                generator
+                    .for_interval(interval)
+                    .candidates
+                    .iter()
+                    .any(|c| c.ratio == ratio),
+                "limit={limit} ratio={ratio}"
             );
         }
     }
