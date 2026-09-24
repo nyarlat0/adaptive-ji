@@ -2,6 +2,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::tuning::VoiceId;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoiceState {
+    Held,
+    ReleasedSustained,
+}
+
 #[derive(Clone, Debug)]
 pub struct Voice {
     pub id: VoiceId,
@@ -10,6 +16,13 @@ pub struct Voice {
     /// Zero-based MIDI wire channel: 1..=15 (displayed as 2..=16).
     pub output_channel: u8,
     pub cents_offset: f64,
+    pub state: VoiceState,
+}
+
+#[derive(Clone, Debug)]
+pub enum KeyRelease {
+    Released(Voice),
+    Sustained(Voice),
 }
 
 #[derive(Default)]
@@ -47,6 +60,7 @@ impl VoiceAllocator {
             velocity,
             output_channel,
             cents_offset: 0.0,
+            state: VoiceState::Held,
         };
         pending.push_back(Some(voice.id));
         self.voices.push(voice.clone());
@@ -54,7 +68,12 @@ impl VoiceAllocator {
     }
 
     /// MIDI 1.0 has no note IDs; repeated keys are matched oldest-first per input channel.
-    pub fn release(&mut self, input_channel: u8, input_note: u8) -> Option<Voice> {
+    pub fn release_key(
+        &mut self,
+        input_channel: u8,
+        input_note: u8,
+        sustain_down: bool,
+    ) -> Option<KeyRelease> {
         let key = (input_channel, input_note);
         let pending = self.pending.get_mut(&key)?;
         let id = pending.pop_front().flatten();
@@ -63,7 +82,45 @@ impl VoiceAllocator {
         }
         let id = id?;
         let index = self.voices.iter().position(|voice| voice.id == id)?;
-        Some(self.voices.remove(index))
+        if sustain_down {
+            let voice = &mut self.voices[index];
+            voice.state = VoiceState::ReleasedSustained;
+            Some(KeyRelease::Sustained(voice.clone()))
+        } else {
+            Some(KeyRelease::Released(self.voices.remove(index)))
+        }
+    }
+
+    /// Remove voices whose keys were released while CC64 was down.
+    pub fn release_sustained(&mut self) -> Vec<Voice> {
+        let mut released = Vec::new();
+        self.voices.retain(|voice| {
+            if voice.state == VoiceState::ReleasedSustained {
+                released.push(voice.clone());
+                false
+            } else {
+                true
+            }
+        });
+        released
+    }
+
+    pub fn state_counts(&self) -> (usize, usize) {
+        let held = self
+            .voices
+            .iter()
+            .filter(|voice| voice.state == VoiceState::Held)
+            .count();
+        (held, self.voices.len() - held)
+    }
+
+    /// Immediate release, retained for callers that do not model sustain.
+    #[cfg(test)]
+    pub fn release(&mut self, input_channel: u8, input_note: u8) -> Option<Voice> {
+        match self.release_key(input_channel, input_note, false)? {
+            KeyRelease::Released(voice) => Some(voice),
+            KeyRelease::Sustained(_) => unreachable!(),
+        }
     }
 
     pub fn clear(&mut self) {
@@ -129,5 +186,55 @@ mod tests {
         assert!(allocator.release(0, 60).is_none());
         assert!(allocator.voices().iter().any(|voice| voice.id == later.id));
         assert_eq!(allocator.release(0, 60).unwrap().id, later.id);
+    }
+
+    #[test]
+    fn sustained_restrikes_keep_distinct_ids_and_channels() {
+        let mut allocator = VoiceAllocator::default();
+        let first = allocator.allocate(0, 60, 80).unwrap();
+        assert!(matches!(
+            allocator.release_key(0, 60, true),
+            Some(KeyRelease::Sustained(voice)) if voice.id == first.id
+        ));
+        let second = allocator.allocate(0, 60, 90).unwrap();
+        assert_ne!(first.id, second.id);
+        assert_ne!(first.output_channel, second.output_channel);
+        assert_eq!(allocator.state_counts(), (1, 1));
+        assert!(matches!(
+            allocator.release_key(0, 60, true),
+            Some(KeyRelease::Sustained(voice)) if voice.id == second.id
+        ));
+        assert_eq!(allocator.state_counts(), (0, 2));
+        let released = allocator.release_sustained();
+        assert_eq!(
+            released.iter().map(|v| v.id).collect::<Vec<_>>(),
+            vec![first.id, second.id]
+        );
+        assert!(allocator.voices().is_empty());
+        assert_eq!(allocator.allocate(0, 60, 100).unwrap().output_channel, 1);
+    }
+
+    #[test]
+    fn all_sustained_voices_reserve_channels_until_pedal_up() {
+        let mut allocator = VoiceAllocator::default();
+        for _ in 0..15 {
+            allocator.allocate(0, 60, 100).unwrap();
+            allocator.release_key(0, 60, true).unwrap();
+        }
+        assert_eq!(allocator.state_counts(), (0, 15));
+        assert!(allocator.allocate(0, 61, 100).is_none());
+        assert_eq!(allocator.release_sustained().len(), 15);
+        assert_eq!(allocator.allocate(0, 62, 100).unwrap().output_channel, 1);
+    }
+
+    #[test]
+    fn pedal_up_keeps_physically_held_voices() {
+        let mut allocator = VoiceAllocator::default();
+        let sustained = allocator.allocate(0, 60, 100).unwrap();
+        allocator.release_key(0, 60, true).unwrap();
+        let held = allocator.allocate(0, 64, 100).unwrap();
+        assert_eq!(allocator.release_sustained()[0].id, sustained.id);
+        assert_eq!(allocator.voices()[0].id, held.id);
+        assert_eq!(allocator.voices()[0].state, VoiceState::Held);
     }
 }

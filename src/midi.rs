@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
-    time::Duration,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use midir::os::unix::VirtualOutput;
 use midir::{Ignore, MidiInput, MidiOutput, MidiOutputConnection};
 
-use crate::{mpe::MpeProcessor, pitch_bend::BendRange, tuning::TuningStrategy};
+use crate::{glide::GlideConfig, mpe::MpeProcessor, pitch_bend::BendRange, tuning::TuningStrategy};
 
 pub const OUTPUT_PORT_NAME: &str = "Adaptive JI Out";
 
@@ -149,7 +149,17 @@ fn virtual_output() -> Result<MidiOutputConnection> {
     bail!("adaptive-ji supports Linux/ALSA only")
 }
 
-pub fn run<T: TuningStrategy>(selector: &str, range: BendRange, tuning: T) -> Result<()> {
+enum LoopMessage {
+    Midi(MidiEvent),
+    Stop,
+}
+
+pub fn run<T: TuningStrategy>(
+    selector: &str,
+    range: BendRange,
+    tuning: T,
+    glide: GlideConfig,
+) -> Result<()> {
     let mut input = input_client()?;
     input.ignore(Ignore::None);
     let ports = input.ports();
@@ -160,16 +170,23 @@ pub fn run<T: TuningStrategy>(selector: &str, range: BendRange, tuning: T) -> Re
         .context("Cannot read MIDI input port names")?;
     let index = select_input(&names, selector)?;
     let mut output = virtual_output()?;
-    let mut processor = MpeProcessor::new(tuning, range);
+    let mut processor = MpeProcessor::with_glide(tuning, range, glide);
+
+    // One bounded queue and one sender thread: the same loop processes input,
+    // optimizer retunes, and due glide bends in strict MIDI output order.
+    let (sender, receiver) = mpsc::sync_channel(1024);
 
     let stopping = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&stopping);
-    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
-        .context("Cannot install Ctrl-C handler")?;
+    let signal_sender = sender.clone();
+    ctrlc::set_handler(move || {
+        signal.store(true, Ordering::Relaxed);
+        let _ = signal_sender.try_send(LoopMessage::Stop);
+    })
+    .context("Cannot install Ctrl-C handler")?;
 
     // The callback never waits for processing/output. Overflow is fatal: silently
     // dropping an arbitrary NoteOff could leave a sounding voice behind.
-    let (sender, receiver) = mpsc::sync_channel(1024);
     let overflow = Arc::new(AtomicBool::new(false));
     let callback_overflow = Arc::clone(&overflow);
     let connection = input
@@ -178,7 +195,7 @@ pub fn run<T: TuningStrategy>(selector: &str, range: BendRange, tuning: T) -> Re
             "adaptive-ji keyboard",
             move |_, bytes, _| {
                 if let Some(event) = parse_message(bytes)
-                    && sender.try_send(event).is_err()
+                    && sender.try_send(LoopMessage::Midi(event)).is_err()
                 {
                     callback_overflow.store(true, Ordering::Relaxed);
                 }
@@ -193,6 +210,7 @@ pub fn run<T: TuningStrategy>(selector: &str, range: BendRange, tuning: T) -> Re
         range.semitones()
     );
     let result = (|| -> Result<()> {
+        let clock_start = Instant::now();
         for message in processor.initialize() {
             output
                 .send(&message)
@@ -204,15 +222,34 @@ pub fn run<T: TuningStrategy>(selector: &str, range: BendRange, tuning: T) -> Re
                     "MIDI input queue overflow; stopping and releasing voices to avoid stuck notes"
                 );
             }
-            match receiver.recv_timeout(Duration::from_millis(20)) {
-                Ok(event) => {
-                    for message in processor.process(event) {
+            let received = if let Some(deadline) = processor.next_glide_deadline() {
+                receiver.recv_timeout(deadline.saturating_sub(clock_start.elapsed()))
+            } else {
+                receiver.recv().map_err(|_| RecvTimeoutError::Disconnected)
+            };
+            match received {
+                Ok(LoopMessage::Midi(event)) => {
+                    for message in processor.process_at(event, clock_start.elapsed()) {
                         output
                             .send(&message)
                             .context("Failed to send MIDI output")?;
                     }
+                    // Busy keyboards must not starve glide ticks. Processing the
+                    // event first also cancels dead/pedal-up voices before ticking.
+                    for message in processor.tick_at(clock_start.elapsed()) {
+                        output
+                            .send(&message)
+                            .context("Failed to send glide Pitch Bend")?;
+                    }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
+                Ok(LoopMessage::Stop) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    for message in processor.tick_at(clock_start.elapsed()) {
+                        output
+                            .send(&message)
+                            .context("Failed to send glide Pitch Bend")?;
+                    }
+                }
                 Err(RecvTimeoutError::Disconnected) => bail!("MIDI input callback disconnected"),
             }
         }

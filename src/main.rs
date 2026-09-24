@@ -1,4 +1,5 @@
 use adaptive_ji::{
+    glide::GlideConfig,
     midi,
     pitch_bend::BendRange,
     tuning::{
@@ -75,6 +76,14 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     roughness_rolloff: f64,
 
+    /// Retune glide duration for already sounding voices, in ms (0..=2000)
+    #[arg(long, default_value_t = 35)]
+    glide_ms: u64,
+
+    /// Bend update interval during glide, in ms (1..=100)
+    #[arg(long, default_value_t = 5)]
+    glide_tick_ms: u64,
+
     /// Log notes, anchor and costs; -vv also logs base/actual offsets and ignored MIDI
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -120,10 +129,16 @@ fn main() -> anyhow::Result<()> {
             }
             Strategy::FiveLimit => Box::new(FiveLimitLowestRoot),
         };
+        let glide = GlideConfig {
+            duration_ms: args.glide_ms,
+            tick_ms: args.glide_tick_ms,
+        };
+        glide.validate().map_err(anyhow::Error::msg)?;
         midi::run(
             args.input.as_deref().expect("clap requires --input"),
             args.bend_range,
             tuning,
+            glide,
         )
     }
 }

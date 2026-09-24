@@ -1,8 +1,8 @@
 [package]
 name = "adaptive-ji"
-version = "0.4.0"
+version = "0.6.0"
 edition = "2024"
-description = "Linux MIDI processor for roughness-aware adaptive just intonation with floating anchor"
+description = "Linux MIDI processor for adaptive just intonation with per-voice glide"
 
 [dependencies]
 anyhow = "1"
