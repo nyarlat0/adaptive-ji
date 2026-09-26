@@ -44,7 +44,7 @@ pub trait TuningStrategy {
         true
     }
 
-    /// MIDI base key for a tuned voice. Static scales may choose a nearby key
+    /// MIDI base key for a tuned voice. Scala mappings may choose a nearby key
     /// so a large microtonal shift does not exhaust the pitch-bend range.
     fn output_note(&self, midi_note: u8) -> u8 {
         midi_note

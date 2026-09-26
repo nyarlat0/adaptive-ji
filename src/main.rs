@@ -197,9 +197,12 @@ fn main() -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?;
         if tuning.unreachable_keys() != 0 {
             log::warn!(
-                "{} Scala keys cannot be represented by MIDI note 0..127 plus ±{} semitone bend and will be silent; increase --bend-range to cover more",
+                "Scala playable input MIDI: {}; unavailable input MIDI: {} ({} of the full 128-key map, not the connected keyboard). Output MIDI 0..127, bend ±{}st, adaptive headroom ±{}c. Details: --scale-info",
+                tuning.playable_key_ranges(),
+                tuning.unreachable_key_ranges(),
                 tuning.unreachable_keys(),
-                args.bend_range.semitones()
+                args.bend_range.semitones(),
+                args.max_deviation
             );
         }
         if args.scale_info {
@@ -216,10 +219,13 @@ fn main() -> anyhow::Result<()> {
                     |path| path.display().to_string()
                 )
             );
+            println!("Playable input MIDI: {}", tuning.playable_key_ranges());
             println!(
-                "Unreachable keys: {} (bend range ±{} semitones)",
+                "Unavailable input MIDI: {} ({} of the full 128-key map; bend ±{} semitones, adaptive headroom ±{}c)",
+                tuning.unreachable_key_ranges(),
                 tuning.unreachable_keys(),
-                args.bend_range.semitones()
+                args.bend_range.semitones(),
+                args.max_deviation
             );
             for note in 0..=127u8 {
                 if let (Some(output_note), Some(offset)) =
@@ -229,6 +235,14 @@ fn main() -> anyhow::Result<()> {
                         .baseline_offset(note)
                         .expect("mapped key has baseline");
                     println!("{note:3} -> {output_note:3}  {offset:+8.3}c  base={base:+.3}c");
+                } else if let Some(base) = tuning.baseline_offset(note) {
+                    let target_midi = f64::from(note) + base / 100.0;
+                    let frequency = 440.0 * ((target_midi - 69.0) / 12.0).exp2();
+                    println!(
+                        "{note:3} -> unavailable  requested MIDI pitch={target_midi:.3}  frequency={frequency:.6}Hz (outside output range including adaptive headroom)"
+                    );
+                } else {
+                    println!("{note:3} -> unmapped (.kbm x)");
                 }
             }
             return Ok(());

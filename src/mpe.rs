@@ -81,8 +81,8 @@ impl<T: TuningStrategy> MpeProcessor<T> {
             } => {
                 if !self.tuning.accepts(note) {
                     self.allocator.ignore_note_on(channel, note);
-                    log::debug!(
-                        "Unmapped Scala key ignored: {} input={note}",
+                    log::warn!(
+                        "NoteOn ignored: {} input={note} is unmapped or outside the Scala output range; see --scale-info",
                         note_name(note)
                     );
                     return output;

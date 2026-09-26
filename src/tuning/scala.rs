@@ -235,9 +235,10 @@ pub fn parse_root_note(text: &str) -> Result<u8, String> {
 #[derive(Clone, Debug)]
 pub struct ScalaTuning {
     pub scale: ScalaScale,
-    /// None means an explicitly unmapped key (`x`). Outside a KBM retune
-    /// range, MIDI is left at its original 12-TET pitch.
+    /// None means an unmapped (`x`) or unrepresentable key. Outside a KBM
+    /// retune range, MIDI is left at its original 12-TET pitch.
     targets: [Option<ScalaTarget>; 128],
+    /// Keep requested pitches even when they cannot be emitted, for diagnostics.
     baseline_offsets: [Option<f64>; 128],
     unreachable_keys: usize,
 }
@@ -310,12 +311,10 @@ impl ScalaTuning {
                 "no Scala keys fit the ±{bend_range_semitones} semitone bend range; increase --bend-range"
             ));
         }
-        let baseline_offsets =
-            std::array::from_fn(|note| targets[note].and(absolute_offsets[note]));
         Ok(Self {
             scale,
             targets,
-            baseline_offsets,
+            baseline_offsets: absolute_offsets,
             unreachable_keys,
         })
     }
@@ -324,7 +323,8 @@ impl ScalaTuning {
         self.targets[usize::from(note)].map(|target| target.cents_offset)
     }
 
-    /// Absolute Scala target offset relative to the input key's 12-TET pitch.
+    /// Requested Scala offset relative to the input key's 12-TET pitch, even
+    /// outside the MIDI output range. `accepts` determines whether it can sound.
     pub fn baseline_offset(&self, note: u8) -> Option<f64> {
         self.baseline_offsets[usize::from(note)]
     }
@@ -341,6 +341,15 @@ impl ScalaTuning {
         self.unreachable_keys
     }
 
+    /// Input MIDI ranges, not the connected keyboard's physical key range.
+    pub fn playable_key_ranges(&self) -> String {
+        key_ranges(|note| self.accepts(note))
+    }
+
+    pub fn unreachable_key_ranges(&self) -> String {
+        key_ranges(|note| !self.accepts(note) && self.baseline_offset(note).is_some())
+    }
+
     /// Reserve room for the adaptive optimizer to move away from the Scala
     /// baseline without silently clipping the MPE bend at the MIDI endpoints.
     pub fn with_adaptive_headroom(
@@ -354,7 +363,6 @@ impl ScalaTuning {
                     > bend_range_semitones * 100.0 + 1e-9
             {
                 self.targets[note] = None;
-                self.baseline_offsets[note] = None;
                 self.unreachable_keys += 1;
             }
         }
@@ -372,6 +380,29 @@ impl ScalaTuning {
             .flatten()
             .map(|target| target.cents_offset.abs())
             .fold(0.0, f64::max)
+    }
+}
+
+fn key_ranges(included: impl Fn(u8) -> bool) -> String {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    // The sentinel closes a range ending at MIDI 127.
+    for note in 0..=128u16 {
+        if note < 128 && included(note as u8) {
+            start.get_or_insert(note);
+        } else if let Some(first) = start.take() {
+            let last = note - 1;
+            ranges.push(if first == last {
+                first.to_string()
+            } else {
+                format!("{first}..{last}")
+            });
+        }
+    }
+    if ranges.is_empty() {
+        "none".into()
+    } else {
+        ranges.join(", ")
     }
 }
 
@@ -470,5 +501,31 @@ mod tests {
         assert!(tuning.unreachable_keys() > 0);
         assert!(!tuning.accepts(127));
         assert!(tuning.max_abs_offset() <= 200.0);
+    }
+
+    #[test]
+    fn tritave_map_keeps_middle_keyboard_range_with_two_semitone_bend() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("scales");
+        let scl = ScalaScale::load(&root.join("13 equal divisions of 3_1.scl")).unwrap();
+        let kbm = KeyboardMapping::load(&root.join("13 equal divisions of 3_1.kbm")).unwrap();
+        let baseline = ScalaTuning::new(scl, Some(kbm), 60, 2.0).unwrap();
+        // 107 fits its baseline pitch, but needs more bend room to guarantee JI.
+        assert!(baseline.accepts(107));
+        let tuning = baseline.with_adaptive_headroom(2.0, 50.0).unwrap();
+        assert_eq!(tuning.playable_key_ranges(), "18..106");
+        assert_eq!(tuning.unreachable_key_ranges(), "0..17, 107..127");
+        assert_eq!(tuning.unreachable_keys(), 39);
+        for note in 36..=96 {
+            assert!(tuning.accepts(note), "middle keyboard note {note}");
+            assert!(tuning.offset(note).unwrap().abs() + 50.0 <= 200.0);
+        }
+        // Preserve 3:1 per 13 keys, including requested pitches beyond MIDI's
+        // output range; diagnostics must distinguish these from KBM holes.
+        let pitch = |note: u8| f64::from(note) * 100.0 + tuning.baseline_offset(note).unwrap();
+        assert!((pitch(73) - pitch(60) - 1200.0 * 3.0f64.log2()).abs() < 1e-6);
+        assert!(pitch(0) < -200.0);
+        assert!(pitch(127) > 12900.0);
+        assert!(!tuning.accepts(107));
+        assert!(tuning.baseline_offset(107).is_some());
     }
 }

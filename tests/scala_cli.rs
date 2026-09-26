@@ -60,3 +60,27 @@ fn invalid_kbm_reports_file_error_before_opening_midi() {
             .contains("cannot read mapping")
     );
 }
+
+#[test]
+fn tritave_diagnostics_identify_full_map_edges_and_show_rejected_pitches() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scales/13 equal divisions of 3_1.scl");
+    let kbm = path.with_extension("kbm");
+    let output = run(&[
+        "--scale",
+        path.to_str().unwrap(),
+        "--kbm",
+        kbm.to_str().unwrap(),
+        "--scale-info",
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("Playable input MIDI: 18..106"));
+    assert!(stdout.contains("Unavailable input MIDI: 0..17, 107..127"));
+    assert!(stdout.contains("  0 -> unavailable  requested MIDI pitch=-27.783"));
+    assert!(stdout.contains("107 -> unavailable"));
+    assert!(stdout.contains("127 -> unavailable  requested MIDI pitch=158.024"));
+    assert!(stdout.contains(" 60 ->  60"));
+    assert!(stderr.contains("39 of the full 128-key map, not the connected keyboard"));
+    assert!(!stderr.contains("increase --bend-range"));
+}
