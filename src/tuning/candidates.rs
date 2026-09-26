@@ -21,7 +21,7 @@ pub struct CandidateSet {
     pub used_fallback: bool,
 }
 
-type CandidateCacheKey = (i16, PrimeLimit, u64, u64, usize, u64, u64);
+type CandidateCacheKey = (i16, u64, PrimeLimit, u64, u64, usize, u64, u64);
 
 pub struct CandidateGenerator {
     config: OptimizerConfig,
@@ -58,9 +58,15 @@ impl CandidateGenerator {
 
     /// MIDI intervals are -127..=127. Cache makes unchanged-reference retunes cheap.
     pub fn for_interval(&mut self, interval: i16) -> &CandidateSet {
+        self.for_target(interval, 0.0)
+    }
+
+    /// `baseline_difference` shifts the Scala target interval relative to 12-TET.
+    pub fn for_target(&mut self, interval: i16, baseline_difference: f64) -> &CandidateSet {
         let config = &self.config;
         let key = (
             interval,
+            baseline_difference.to_bits(),
             config.prime_limit,
             config.max_deviation_cents.to_bits(),
             config.max_complexity.to_bits(),
@@ -69,7 +75,7 @@ impl CandidateGenerator {
             config.weights.deviation.to_bits(),
         );
         self.cache.entry(key).or_insert_with(|| {
-            let target = f64::from(interval) * 100.0;
+            let target = f64::from(interval) * 100.0 + baseline_difference;
             let mut all: Vec<_> = self
                 .odd_pool
                 .iter()
@@ -78,7 +84,7 @@ impl CandidateGenerator {
                     let ratio = ratio.scale_pow2(octave)?;
                     Some(Candidate {
                         ratio,
-                        offset_cents: ratio.cents() - target,
+                        offset_cents: ratio.cents() - f64::from(interval) * 100.0,
                     })
                 })
                 .collect();
@@ -87,20 +93,21 @@ impl CandidateGenerator {
             if all.is_empty() {
                 all.push(Candidate {
                     ratio: Ratio::ONE,
-                    offset_cents: -target,
+                    offset_cents: -f64::from(interval) * 100.0,
                 });
             }
             let nearest = *all
                 .iter()
                 .min_by(|a, b| {
-                    a.offset_cents
+                    (a.offset_cents - baseline_difference)
                         .abs()
-                        .total_cmp(&b.offset_cents.abs())
+                        .total_cmp(&(b.offset_cents - baseline_difference).abs())
                         .then_with(|| a.ratio.cmp(&b.ratio))
                 })
                 .expect("nonempty pool");
             all.retain(|candidate| {
-                candidate.offset_cents.abs() <= config.max_deviation_cents + 1e-9
+                (candidate.offset_cents - baseline_difference).abs()
+                    <= config.max_deviation_cents + 1e-9
             });
             let used_fallback = all.is_empty();
             if used_fallback {
@@ -108,18 +115,23 @@ impl CandidateGenerator {
                     "No candidate within ±{}c for MIDI interval {interval}; using {} ({:+.3}c)",
                     config.max_deviation_cents,
                     nearest.ratio,
-                    nearest.offset_cents
+                    nearest.offset_cents - baseline_difference
                 );
                 all.push(nearest);
             }
             let rank = |candidate: &Candidate| {
                 config.weights.harmonic * harmonic_complexity(candidate.ratio)
-                    + config.weights.deviation * (candidate.offset_cents / 25.0).powi(2)
+                    + config.weights.deviation
+                        * ((candidate.offset_cents - baseline_difference) / 25.0).powi(2)
             };
             all.sort_unstable_by(|a, b| {
                 rank(a)
                     .total_cmp(&rank(b))
-                    .then_with(|| a.offset_cents.abs().total_cmp(&b.offset_cents.abs()))
+                    .then_with(|| {
+                        (a.offset_cents - baseline_difference)
+                            .abs()
+                            .total_cmp(&(b.offset_cents - baseline_difference).abs())
+                    })
                     .then_with(|| a.ratio.cmp(&b.ratio))
             });
             let generated_count = all.len();
@@ -205,6 +217,16 @@ fn bounded_odd_ratios(limit: PrimeLimit, budget: f64) -> Vec<Ratio> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scala_target_shift_changes_candidates_and_has_distinct_cache_entry() {
+        let mut generator = CandidateGenerator::new(OptimizerConfig::default()).unwrap();
+        let plain = generator.for_target(4, 0.0).candidates.clone();
+        let shifted = generator.for_target(4, -45.0).candidates.clone();
+        assert_ne!(plain, shifted);
+        assert_eq!(plain, generator.for_target(4, 0.0).candidates);
+        assert_eq!(shifted, generator.for_target(4, -45.0).candidates);
+    }
 
     #[test]
     fn includes_third_fifth_and_harmonic_seventh() {

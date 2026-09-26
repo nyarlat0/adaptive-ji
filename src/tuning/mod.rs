@@ -6,6 +6,7 @@ pub mod prime_limit;
 pub mod profile;
 pub mod rational;
 pub mod roughness;
+pub mod scala;
 
 pub use adaptive::{AdaptiveRationalOptimizer, OptimizerConfig, ScoreWeights};
 pub use five_limit::FiveLimitLowestRoot;
@@ -37,10 +38,37 @@ pub struct TunedNote {
 /// their own notion of the previous target.
 pub trait TuningStrategy {
     fn tune(&mut self, active_notes: &[ActiveNote]) -> Vec<TunedNote>;
+
+    /// An unmapped Scala key is silent. Other strategies accept every key.
+    fn accepts(&self, _midi_note: u8) -> bool {
+        true
+    }
+
+    /// MIDI base key for a tuned voice. Static scales may choose a nearby key
+    /// so a large microtonal shift does not exhaust the pitch-bend range.
+    fn output_note(&self, midi_note: u8) -> u8 {
+        midi_note
+    }
+
+    fn label(&self, tuned: &TunedNote) -> String {
+        tuned.ratio.to_string()
+    }
 }
 
 impl<T: TuningStrategy + ?Sized> TuningStrategy for Box<T> {
     fn tune(&mut self, active_notes: &[ActiveNote]) -> Vec<TunedNote> {
         (**self).tune(active_notes)
+    }
+
+    fn accepts(&self, midi_note: u8) -> bool {
+        (**self).accepts(midi_note)
+    }
+
+    fn output_note(&self, midi_note: u8) -> u8 {
+        (**self).output_note(midi_note)
+    }
+
+    fn label(&self, tuned: &TunedNote) -> String {
+        (**self).label(tuned)
     }
 }

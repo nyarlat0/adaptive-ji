@@ -12,6 +12,7 @@ pub enum VoiceState {
 pub struct Voice {
     pub id: VoiceId,
     pub input_note: u8,
+    pub output_note: u8,
     pub velocity: u8,
     /// Zero-based MIDI wire channel: 1..=15 (displayed as 2..=16).
     pub output_channel: u8,
@@ -34,6 +35,14 @@ pub struct VoiceAllocator {
 }
 
 impl VoiceAllocator {
+    /// Preserve FIFO NoteOff pairing for a key intentionally left unmapped.
+    pub fn ignore_note_on(&mut self, input_channel: u8, input_note: u8) {
+        self.pending
+            .entry((input_channel, input_note))
+            .or_default()
+            .push_back(None);
+    }
+
     pub fn voices(&self) -> &[Voice] {
         &self.voices
     }
@@ -43,6 +52,16 @@ impl VoiceAllocator {
     }
 
     pub fn allocate(&mut self, input_channel: u8, input_note: u8, velocity: u8) -> Option<Voice> {
+        self.allocate_mapped(input_channel, input_note, input_note, velocity)
+    }
+
+    pub fn allocate_mapped(
+        &mut self,
+        input_channel: u8,
+        input_note: u8,
+        output_note: u8,
+        velocity: u8,
+    ) -> Option<Voice> {
         let channel = (1..=15).find(|channel| {
             self.voices
                 .iter()
@@ -57,6 +76,7 @@ impl VoiceAllocator {
         let voice = Voice {
             id: self.next_id,
             input_note,
+            output_note,
             velocity,
             output_channel,
             cents_offset: 0.0,

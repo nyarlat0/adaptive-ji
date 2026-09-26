@@ -10,8 +10,8 @@ const REINFORCEMENT: f64 = 0.25;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum MemoryMode {
-    #[default]
     Off,
+    #[default]
     Relations,
 }
 

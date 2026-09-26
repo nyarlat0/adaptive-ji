@@ -1,4 +1,4 @@
-# adaptive-ji 1.0.0
+# adaptive-ji 1.1.0
 
 CLI-программа для Linux: принимает обычный MIDI 1.0 через `midir`/ALSA,
 подбирает контекстный adaptive just intonation с configurable arbitrary
@@ -6,6 +6,11 @@ prime limit для всего аккорда с учётом
 приближённой roughness между partials выбранного спектра и выдаёт
 MPE-подобный поток через виртуальный ALSA MIDI-порт **Adaptive JI Out**.
 GUI, аудиодвижка, JACK API и плагинов в программе нет.
+
+В 1.1 Scala `.scl` с `.kbm` или без него задаёт **базовые высоты клавиш**.
+Поверх них тот же adaptive optimizer продолжает выбирать рациональные отношения
+всего аккорда, учитывать roughness, память и движение, а затем плавно перестраивать
+уже звучащие голоса. Scala — ориентир, а не запрет на JI-коррекцию.
 
 ## Сборка и запуск
 
@@ -72,14 +77,15 @@ adaptive-ji --input "KeyRig" --spectrum bright -v
 adaptive-ji --input "KeyRig" --spectrum-file spectrum.toml -v
 adaptive-ji --input "KeyRig" --prime-limit 11 --max-deviation 60 -v
 adaptive-ji --input "KeyRig" --memory-mode relations --w-memory 1.0 -v
+adaptive-ji --input "KeyRig" --memory-mode off -v
 ```
 
 Настройки optimizer (показаны defaults):
 
 ```bash
 adaptive-ji --input "KeyRig" --strategy adaptive \
-  --max-deviation 35 --candidates-per-note 8 --beam-width 2048 \
-  --prime-limit 7 \
+  --max-deviation 50 --candidates-per-note 8 --beam-width 2048 \
+  --prime-limit 11 \
   --max-complexity 12 \
   --anchor-mode floating --anchor-max 35 \
   --w-harmonic 1 --w-deviation 0.35 --w-movement 1.5 --w-roughness 20 \
@@ -101,22 +107,75 @@ adaptive-ji --input "KeyRig" --strategy adaptive \
 partials, превышение выдаёт ошибку без усечения.
 Нулевые K/beam и NaN/бесконечности отклоняются до открытия MIDI-порта.
 Более широкий beam и больше candidates увеличивают время пересчёта.
-`--prime-limit` принимает любой простой предел от 3 до 997 (default 7):
+`--prime-limit` принимает любой простой предел от 3 до 997 (CLI default 11):
 p-limit разрешает все простые множители `<= p`. 5-limit использует 2/3/5,
 7-limit добавляет septimal 7, 11-limit — undecimal 11, а 13/17 и выше
 расширяют пространство аналогично. Более высокий предел не означает «лучше».
 Кандидаты ищутся bounded best-first поиском по modified Tenney complexity;
 полного Cartesian произведения exponent axes нет. `--max-complexity` (default
 12) задаёт budget этого поиска.
-По умолчанию `--memory-mode off`: это полностью совместимый с v0.95 режим
-без memory lookup, memory costs и обновления состояния. Экспериментальный
-`--memory-mode relations` хранит до нескольких octave-equivalent rational
+В 1.1 по умолчанию включён экспериментальный `--memory-mode relations`:
+он хранит до нескольких octave-equivalent rational
 relations между MIDI pitch classes. Настройки: `--w-memory 1.0`,
 `--memory-decay 0.80`, `--memory-reset-on-empty true`. Это не chord/key
 recognition и не ML: memory хранит sparse prime-exponent fingerprints, а не
 absolute cents, anchor, glide или MIDI channels. C# и Db намеренно совпадают.
 Memory обновляется после финального assignment, но не на glide ticks.
-`--anchor-mode fixed` воспроизводит привязку reference к 0 cents из v0.3.
+Это даёт больше гармонической зависимости от истории; при желании отключите
+её флагом `--memory-mode off` — без lookup, cost и обновления памяти.
+CLI defaults также расширены с 7-limit/35c до 11-limit/50c при прежнем K8, чтобы
+undecimal-кандидаты вроде 11/8 действительно могли попадать в поиск.
+Более широкий поиск не делает каждый результат «лучше»; для прежнего
+консервативного профиля укажите `--prime-limit 7 --max-deviation 35
+--candidates-per-note 8 --memory-mode off`.
+
+## Импорт Scala `.scl` / `.kbm`
+
+```bash
+adaptive-ji --input "KeyRig" --scale scales/albionbyz.scl -v
+adaptive-ji --input "KeyRig" \
+  --scale "scales/13-limit scale from Brendan Byrnes Operator.scl" -v
+adaptive-ji --input "KeyRig" --scale scales/albionbyz.scl --root-note D4 -v
+adaptive-ji --input "KeyRig" --scale some.scl --kbm custom.kbm -v
+adaptive-ji --scale-info --scale scales/albionbyz.scl
+```
+
+Если рядом с `.scl` есть одноимённый `.kbm`, он подхватывается автоматически.
+`--kbm` выбирает другой файл явно. `--no-kbm` отключает автопоиск; `--root-note`
+(MIDI 0–127 либо `C4`, `F#3`, `Bb2` и т. п.) тоже использует маппинг **без**
+`.kbm`. При отсутствии карты последовательные клавиши идут по последовательным
+ступеням от degree 0 на C4/MIDI 60, повторяясь через период, указанный
+последней ступенью `.scl`. Частота root при таком маппинге равна его обычной
+12-TET частоте при A4=440 Hz. С `.kbm` учитываются границы диапазона, middle
+key, reference MIDI note/frequency, formal octave degree, повторяющийся pattern
+и `x` для немаппированных клавиш. Клавиши вне `.kbm` диапазона имеют
+12-TET базовую высоту; `x` не звучит. `--scale-info` печатает базовую карту
+без ALSA; это **не** итоговые высоты, зависящие от текущего аккорда.
+
+Для каждой ступени программа выбирает ближайший MIDI NoteOn и оставляет только
+остаток в Pitch Bend; выбор MIDI NoteOn сохраняется на всю жизнь голоса, включая
+NoteOff, sustain и panic. Для adaptive коррекции резервируется пространство
+`--max-deviation` внутри `--bend-range`. Если высота недостижима (обычно на
+краях MIDI 0–127 для неоктавных шкал), клавиша не звучит и при загрузке
+выводится предупреждение. Увеличьте `--bend-range` и выставьте такой же MPE
+range в синтезаторе.
+
+Именно Scala-интервалы служат центрами candidate windows: deviation считает
+отклонение от импортированной высоты, а floating anchor привязывается к Scala
+высоте старейшего голоса. `--prime-limit`, harmonic complexity, roughness,
+movement, memory и beam search продолжают работать. Например, если `.scl`
+задаёт E4 на −20c относительно 12-TET, оптимизатор может выбрать чистое 5/4
+около −13.686c, когда это улучшает аккорд. При `--scale` используется
+`--strategy adaptive`; старый `five-limit` baseline с ним не совмещается.
+
+Формат `.scl`: комментарии начинаются с `!`, первый текст — описание, затем
+число ступеней и значения в cents (`386.31`) или отношениях (`5/4`). Последнее
+значение — период и может быть не 2/1. Формат `.kbm` задаёт отдельную
+клавиатурную карту; подробности есть в
+[описании Scala scale format](https://www.huygens-fokker.org/scala/scl_format.html)
+и [Scala keyboard mappings](https://www.huygens-fokker.org/scala/help.htm#mappings).
+Без Scala `--anchor-mode fixed` воспроизводит привязку reference к 0 cents
+из v0.3; со Scala он фиксирует anchor на базовой высоте reference.
 `--w-roughness 0` исключает pairwise roughness из поиска, но оставляет выбранный
 anchor mode. Для сравнения именно с v0.2 используйте обе настройки:
 `--anchor-mode fixed --w-roughness 0`.
@@ -209,16 +268,19 @@ E=1/1, G=6/5, C=8/5; интервал C/G=4/3. Общий anchor не меняе
 
 `Ratio` хранит положительные сокращённые `u64` numerator/denominator. Умножение,
 деление и масштабирование на степени двойки проверяют переполнение и выполняют
-сокращение до умножения. Для генерации перебираются степени 3: −4..4, 5: −3..3,
-7: −2..2, а для 11-limit также 11: −1..1; степень двойки выбирается под MIDI-интервал, включая
-отрицательные интервалы и несколько октав.
+сокращение до умножения. Кандидаты генерируются bounded best-first поиском
+по нечётным простым множителям до выбранного prime limit и complexity budget;
+степень двойки подбирается под MIDI-интервал, включая отрицательные интервалы
+и несколько октав.
 
-Candidates фильтруются по `abs(base_offset) <= max_deviation`, затем ранжируются по
-`w_harmonic * complexity(ratio) + w_deviation * (offset/25)^2`, и остаются лучшие K.
+Пусть `scala_i` — базовый offset клавиши от 12-TET (0 без `.scl`). Candidates
+фильтруются по `abs(base_offset - (scala_i - scala_reference)) <= max_deviation`,
+затем ранжируются по harmonic complexity и отклонению от этого Scala-интервала;
+остаются лучшие K.
 При равенстве используются абсолютное отклонение и целочисленные numerator/denominator.
 Это только предварительное сокращение набора: итоговые harmonic и roughness
 score считают **все** пары с одинаковым весом, без особого преимущества reference.
-При default K=8 генератор сохраняет 5/4, 6/5, 3/2 и 7/4 в соответствующих
+При CLI default K=8 генератор сохраняет важные 5/4, 6/5, 3/2 и 7/4 в соответствующих
 интервалах. Roughness не используется для отсеивания относительно reference.
 
 При пустом окне используется ближайший ratio из конечного выбранного prime-limit набора с warning
@@ -233,12 +295,13 @@ score считают **все** пары с одинаковым весом, б�
 Допустимый anchor для полного или частичного assignment — пересечение:
 
 ```text
-[-anchor_max, +anchor_max]
-∩ [-max_deviation - base_i, +max_deviation - base_i] для каждого обычного candidate i
+[scala_reference - anchor_max, scala_reference + anchor_max]
+∩ [scala_i - max_deviation - base_i,
+   scala_i + max_deviation - base_i] для каждого обычного candidate i
 ```
 
-При `--anchor-mode fixed` anchor строго 0 и старый score v0.3 сохраняется.
-При floating ограничения гарантируют `abs(actual_offset_i) <= max_deviation`
+При `--anchor-mode fixed` anchor равен `scala_reference` (0 без Scala).
+При floating ограничения гарантируют `abs(actual_offset_i - scala_i) <= max_deviation`
 для обычных candidates. Fallback за пределами невозможного узкого candidate
 окна сохраняет документированное исключение v0.3: для него этот предел не
 применяется, иначе при некоторых допустимых настройках решения не существует.
@@ -268,7 +331,7 @@ ratios и anchor выбираются совместно.
 complexity(p/q) = log2(odd_num) + log2(odd_den)
 
 harmonic = sum over i < j: complexity(ratio_j / ratio_i)
-deviation = sum: ((anchor + base_offset) / 25)^2
+deviation = sum: ((anchor + base_offset - scala_offset) / 25)^2
 movement = sum over sounding voices: ((anchor + base_offset - current_audible_offset) / 10)^2
 roughness = sum over i < j: R(spectrum_i, spectrum_j)
 score = w_harmonic * harmonic + w_deviation * deviation
@@ -279,9 +342,8 @@ score = w_harmonic * harmonic + w_deviation * deviation
 Например, complexity(3/2)=log2(3), complexity(6/5)=log2(15); октавы не меняют
 сложность. Новая нота не получает movement penalty. Предыдущие offsets хранятся
 по voice ID, а не MIDI note; отпущенные экземпляры удаляются из истории.
-В v0.6 история optimizer по-прежнему сравнивает **target-to-target** offsets,
-а не фактическую позицию посреди glide. Выводной слой при новом retarget берёт
-текущую интерполированную позицию, поэтому сама MIDI-траектория непрерывна.
+Начиная с v0.9 optimizer сравнивает с фактически интерполированной слышимой
+позицией на момент retune; тот же snapshot служит началом нового glide.
 
 Beam search сначала назначает reference, затем остальные voices по MIDI note и ID.
 На каждом шаге добавляются индивидуальные costs и парные costs со всеми уже
@@ -306,8 +368,9 @@ prime limit, max-complexity)`. Внутренний защитный cap пои�
 полученного bounded pool.
 
 Классический undecimal пример `11/8 = 551.318 cents`. Для tritone MIDI 60→66
-это offset примерно `-48.682 cents`, поэтому стандартный `max-deviation=35`
-намеренно его исключает. Для диагностики используйте `--max-deviation 60`.
+это offset примерно `-48.682 cents`: новый CLI default `max-deviation=50`
+допускает его, а прежний консервативный `35` исключал. Для диагностики
+можно использовать `--max-deviation 60`.
 Для пары 60→66 roughness scan показывает profile-dependent ranking: sine даёт
 примерно `16/11=0.0154` против `11/8=0.0301`, а bright — `11/8=0.0994`
 против `16/11=0.1018`. Это следствие cross-partial model, а не специальное

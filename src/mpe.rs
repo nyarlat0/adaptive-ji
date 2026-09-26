@@ -79,7 +79,19 @@ impl<T: TuningStrategy> MpeProcessor<T> {
                 note,
                 velocity,
             } => {
-                let Some(voice) = self.allocator.allocate(channel, note, velocity) else {
+                if !self.tuning.accepts(note) {
+                    self.allocator.ignore_note_on(channel, note);
+                    log::debug!(
+                        "Unmapped Scala key ignored: {} input={note}",
+                        note_name(note)
+                    );
+                    return output;
+                }
+                let output_note = self.tuning.output_note(note);
+                let Some(voice) =
+                    self.allocator
+                        .allocate_mapped(channel, note, output_note, velocity)
+                else {
                     log::warn!(
                         "No free MPE channel (15 voices); ignoring NoteOn {} input={note}",
                         note_name(note)
@@ -95,7 +107,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
                 // Virtual ports may be connected after startup, so repeat RPN at allocation.
                 output.extend(self.bend_range.rpn(voice.output_channel));
                 self.retune(now, &mut output);
-                output.push([0x90 | voice.output_channel, note, velocity]);
+                output.push([0x90 | voice.output_channel, voice.output_note, velocity]);
             }
             MidiEvent::NoteOff {
                 channel,
@@ -167,7 +179,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
             voice.output_channel + 1,
             if sustained { " sustained" } else { "" }
         );
-        output.push([0x80 | voice.output_channel, note, velocity]);
+        output.push([0x80 | voice.output_channel, voice.output_note, velocity]);
         if !sustained {
             self.glide.remove(voice.id);
             output.push(encode_pitch_bend(voice.output_channel, CENTER));
@@ -190,17 +202,30 @@ impl<T: TuningStrategy> MpeProcessor<T> {
             .map(|voice| ActiveNote {
                 id: voice.id,
                 input_note: voice.input_note,
-                current_offset_cents: snapshot.get(&voice.id).copied(),
+                current_offset_cents: snapshot.get(&voice.id).map(|emitted| {
+                    emitted + 100.0 * (f64::from(voice.output_note) - f64::from(voice.input_note))
+                }),
             })
             .collect();
         for tuned in self.tuning.tune(&notes) {
             if let Some(voice) = self.allocator.voice_mut(tuned.id) {
                 voice.cents_offset = tuned.cents_offset;
-                let bend = cents_to_pitch_bend(tuned.cents_offset, self.bend_range.semitones());
+                let output_cents = tuned.cents_offset
+                    + 100.0 * (f64::from(voice.input_note) - f64::from(voice.output_note));
+                if output_cents.abs() > self.bend_range.semitones() * 100.0 + 1e-6 {
+                    log::warn!(
+                        "Pitch bend clipped for {} voice={} ch={}: {output_cents:+.3}c exceeds ±{} semitones",
+                        note_name(voice.input_note),
+                        voice.id,
+                        voice.output_channel + 1,
+                        self.bend_range.semitones()
+                    );
+                }
+                let bend = cents_to_pitch_bend(output_cents, self.bend_range.semitones());
                 match self.glide.retarget_from(
                     tuned.id,
                     snapshot.get(&tuned.id).copied(),
-                    tuned.cents_offset,
+                    output_cents,
                     now,
                 ) {
                     TargetUpdate::Immediate(value) => {
@@ -222,7 +247,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
                 log::info!(
                     "TUNE     {:<4} {:<7} {:+.3}c  bend={bend}",
                     note_name(voice.input_note),
-                    tuned.ratio.to_string(),
+                    self.tuning.label(&tuned),
                     tuned.cents_offset
                 );
             }
@@ -259,7 +284,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
         self.glide.clear();
         let mut output = Vec::with_capacity(62);
         for voice in self.allocator.voices() {
-            output.push([0x80 | voice.output_channel, voice.input_note, 0]);
+            output.push([0x80 | voice.output_channel, voice.output_note, 0]);
         }
         for channel in 0..=15 {
             // All Notes Off alone does not silence sustain-held notes.
@@ -280,10 +305,30 @@ impl<T: TuningStrategy> MpeProcessor<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::{cell::Cell, rc::Rc};
 
     use super::*;
     use crate::tuning::FiveLimitLowestRoot;
+    use crate::tuning::{
+        OptimizerConfig,
+        profile::{SpectrumPreset, SpectrumProfile},
+        scala::{KeyboardMapping, ScalaScale, ScalaTuning},
+    };
+
+    fn scala_processor(
+        tuning: ScalaTuning,
+    ) -> MpeProcessor<crate::tuning::AdaptiveRationalOptimizer> {
+        let config = OptimizerConfig::default();
+        let profile = SpectrumProfile::builtin(SpectrumPreset::Harmonic, config.roughness).unwrap();
+        let optimizer = crate::tuning::AdaptiveRationalOptimizer::with_profile_and_scale(
+            config,
+            profile,
+            Some(tuning),
+        )
+        .unwrap();
+        MpeProcessor::new(optimizer, "2".parse().unwrap())
+    }
     use crate::voice::VoiceState;
 
     fn processor() -> MpeProcessor<FiveLimitLowestRoot> {
@@ -368,6 +413,94 @@ mod tests {
 
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
+    }
+
+    #[test]
+    fn mapped_note_mid_glide_snapshot_is_converted_back_to_input_pitch() {
+        struct MappingProbe(Rc<RefCell<Vec<Vec<ActiveNote>>>>);
+        impl TuningStrategy for MappingProbe {
+            fn output_note(&self, note: u8) -> u8 {
+                if note == 61 { 62 } else { note }
+            }
+
+            fn tune(&mut self, notes: &[ActiveNote]) -> Vec<crate::tuning::TunedNote> {
+                self.0.borrow_mut().push(notes.to_vec());
+                notes
+                    .iter()
+                    .map(|note| crate::tuning::TunedNote {
+                        id: note.id,
+                        ratio: crate::tuning::Ratio::ONE,
+                        cents_offset: if note.input_note == 61 {
+                            if notes.len() == 1 { 150.0 } else { 130.0 }
+                        } else {
+                            0.0
+                        },
+                    })
+                    .collect()
+            }
+        }
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let mut processor = MpeProcessor::with_glide(
+            MappingProbe(Rc::clone(&observed)),
+            "2".parse().unwrap(),
+            GlideConfig {
+                duration_ms: 100,
+                tick_ms: 5,
+            },
+        );
+        assert_eq!(
+            processor.process_at(on(61), ms(0)).last(),
+            Some(&[0x91, 62, 100])
+        );
+        processor.process_at(on(64), ms(10));
+        processor.process_at(on(67), ms(35));
+        let calls = observed.borrow();
+        let input_relative = calls[2]
+            .iter()
+            .find(|note| note.input_note == 61)
+            .unwrap()
+            .current_offset_cents
+            .unwrap();
+        assert!((input_relative - 145.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scala_remaps_note_on_and_all_release_paths_consistently() {
+        let scale = ScalaScale::parse("wide\n2\n150.0\n1200.0\n").unwrap();
+        let tuning = ScalaTuning::new(scale, None, 60, 2.0).unwrap();
+        let mut processor = scala_processor(tuning);
+        let messages = processor.process(on(61));
+        assert_eq!(messages.last(), Some(&[0x91, 62, 100]));
+        assert_eq!(processor.voices()[0].input_note, 61);
+        assert_eq!(processor.voices()[0].output_note, 62);
+        assert!(messages.contains(&encode_pitch_bend(1, cents_to_pitch_bend(-50.0, 2.0))));
+        let off_messages = processor.process(off(61));
+        assert!(off_messages.contains(&[0x81, 62, 45]));
+
+        processor.process(on(61));
+        processor.process(pedal(127));
+        let sustained_off = processor.process(off(61));
+        assert!(sustained_off.contains(&[0x81, 62, 45]));
+        assert_eq!(processor.voices().len(), 1);
+        processor.process(pedal(0));
+        assert!(processor.voices().is_empty());
+        processor.process(on(61));
+        let shutdown = processor.shutdown();
+        assert!(shutdown.contains(&[0x81, 62, 0]));
+    }
+
+    #[test]
+    fn scala_unmapped_keys_do_not_consume_channels_or_release_other_voices() {
+        let scale = ScalaScale::parse("gaps\n2\n100.0\n1200.0\n").unwrap();
+        let map = KeyboardMapping::parse("2\n60\n70\n60\n60\n261.625565\n2\n0\nx\n").unwrap();
+        let tuning = ScalaTuning::new(scale, Some(map), 60, 2.0).unwrap();
+        let mut processor = scala_processor(tuning);
+        assert!(processor.process(on(61)).is_empty());
+        assert!(processor.voices().is_empty());
+        assert_eq!(processor.process(on(62)).last(), Some(&[0x91, 72, 100]));
+        assert!(processor.process(off(61)).is_empty());
+        assert_eq!(processor.voices().len(), 1);
+        assert!(processor.process(off(62)).contains(&[0x81, 72, 45]));
     }
 
     #[test]

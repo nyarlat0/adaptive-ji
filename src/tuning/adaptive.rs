@@ -8,6 +8,7 @@ use super::{
     profile::{SpectrumPreset, SpectrumProfile},
     rational::harmonic_complexity,
     roughness::{RoughnessConfig, Spectrum, SpectrumModel, fundamental_frequency, roughness},
+    scala::ScalaTuning,
 };
 
 pub const MAX_VOICES: usize = 15;
@@ -61,7 +62,7 @@ impl Default for OptimizerConfig {
         Self {
             prime_limit: PrimeLimit::default(),
             max_complexity: 12.0,
-            memory_mode: MemoryMode::Off,
+            memory_mode: MemoryMode::Relations,
             memory_decay: 0.80,
             memory_reset_on_empty: true,
             max_deviation_cents: 35.0,
@@ -100,6 +101,7 @@ impl OptimizerConfig {
             ("w-deviation", self.weights.deviation),
             ("w-movement", self.weights.movement),
             ("w-roughness", self.weights.roughness),
+            ("w-memory", self.weights.memory),
         ] {
             if !value.is_finite() || !(0.0..=1e6).contains(&value) {
                 return Err(format!("{name} must be finite and in 0..=1000000"));
@@ -146,7 +148,7 @@ pub struct AdaptiveSolution {
     pub anchor_cents: f64,
 }
 
-/// Q(a) = w_dev * sum((a + b)/25)^2
+/// Q(a) = w_dev * sum((a + b - scala_baseline)/25)^2
 ///      + w_move * sum_held((a + b - current)/10)^2.
 /// Each candidate updates these sufficient statistics in O(1).
 #[derive(Clone, Copy, Debug, Default)]
@@ -160,10 +162,11 @@ struct QuadraticStats {
 }
 
 impl QuadraticStats {
-    fn add(&mut self, base: f64, current: Option<f64>) {
+    fn add(&mut self, base: f64, baseline: f64, current: Option<f64>) {
         self.count += 1.0;
-        self.sum_base += base;
-        self.sum_base_sq += base * base;
+        let deviation_base = base - baseline;
+        self.sum_base += deviation_base;
+        self.sum_base_sq += deviation_base * deviation_base;
         if let Some(current) = current {
             let delta = base - current;
             self.held += 1.0;
@@ -200,9 +203,9 @@ struct AnchorBounds {
 }
 
 impl AnchorBounds {
-    fn restrict(self, base: f64, max_deviation: f64) -> Option<Self> {
-        let lower = self.lower.max(-max_deviation - base);
-        let upper = self.upper.min(max_deviation - base);
+    fn restrict(self, base: f64, baseline: f64, max_deviation: f64) -> Option<Self> {
+        let lower = self.lower.max(baseline - max_deviation - base);
+        let upper = self.upper.min(baseline + max_deviation - base);
         (lower <= upper).then_some(Self { lower, upper })
     }
 
@@ -216,6 +219,7 @@ impl AnchorBounds {
 #[derive(Clone, Copy)]
 struct UnaryTerm {
     base: f64,
+    baseline: f64,
     current: Option<f64>,
     deviation: f64,
     movement: f64,
@@ -274,6 +278,7 @@ pub struct AdaptiveRationalOptimizer {
     previous: BTreeMap<VoiceId, f64>,
     last_solution: Option<AdaptiveSolution>,
     relation_memory: RelationMemory,
+    scale: Option<ScalaTuning>,
 }
 
 impl Default for AdaptiveRationalOptimizer {
@@ -289,6 +294,14 @@ impl AdaptiveRationalOptimizer {
     }
 
     pub fn with_profile(config: OptimizerConfig, profile: SpectrumProfile) -> Result<Self, String> {
+        Self::with_profile_and_scale(config, profile, None)
+    }
+
+    pub fn with_profile_and_scale(
+        config: OptimizerConfig,
+        profile: SpectrumProfile,
+        scale: Option<ScalaTuning>,
+    ) -> Result<Self, String> {
         config.validate()?;
         let spectrum_model = SpectrumModel::from_profile(profile);
         // Reject finite-but-unrepresentable custom ratios at startup, not in a
@@ -302,7 +315,14 @@ impl AdaptiveRationalOptimizer {
             previous: BTreeMap::new(),
             last_solution: None,
             relation_memory: RelationMemory::default(),
+            scale,
         })
+    }
+
+    fn baseline(&self, note: u8) -> f64 {
+        self.scale
+            .as_ref()
+            .map_or(0.0, |scale| scale.baseline_offset(note).unwrap_or(0.0))
     }
 
     pub fn last_solution(&self) -> Option<&AdaptiveSolution> {
@@ -319,6 +339,7 @@ impl AdaptiveRationalOptimizer {
             .iter()
             .min_by_key(|note| note.id)
             .expect("nonempty chord");
+        let reference_baseline = self.baseline(reference.input_note);
         let mut ordered = notes.to_vec();
         ordered.sort_unstable_by_key(|note| (note.id != reference.id, note.input_note, note.id));
         let mut fallback_notes = Vec::with_capacity(ordered.len());
@@ -332,9 +353,10 @@ impl AdaptiveRationalOptimizer {
                         offset_cents: 0.0,
                     }]
                 } else {
-                    let set = self
-                        .generator
-                        .for_interval(i16::from(note.input_note) - i16::from(reference.input_note));
+                    let set = self.generator.for_target(
+                        i16::from(note.input_note) - i16::from(reference.input_note),
+                        self.baseline(note.input_note) - reference_baseline,
+                    );
                     fallback_notes.push(set.used_fallback);
                     set.candidates.clone()
                 }
@@ -349,12 +371,20 @@ impl AdaptiveRationalOptimizer {
             .enumerate()
             .map(|(index, (note, list))| {
                 list.iter()
-                    .map(|candidate| UnaryTerm {
-                        base: candidate.offset_cents,
-                        current: note.current_offset_cents,
-                        deviation: (candidate.offset_cents / 25.0).powi(2),
-                        movement: movement_cost(candidate.offset_cents, note.current_offset_cents),
-                        fallback: fallback_notes[index],
+                    .map(|candidate| {
+                        let base = candidate.offset_cents;
+                        let baseline = self.baseline(note.input_note);
+                        UnaryTerm {
+                            base,
+                            baseline,
+                            current: note.current_offset_cents,
+                            deviation: ((reference_baseline + base - baseline) / 25.0).powi(2),
+                            movement: movement_cost(
+                                reference_baseline + base,
+                                note.current_offset_cents,
+                            ),
+                            fallback: fallback_notes[index],
+                        }
                     })
                     .collect()
             })
@@ -370,8 +400,10 @@ impl AdaptiveRationalOptimizer {
                     .map(|(note, list)| {
                         list.iter()
                             .map(|candidate| {
-                                let frequency =
-                                    fundamental_frequency(note.input_note, candidate.offset_cents);
+                                let frequency = fundamental_frequency(
+                                    note.input_note,
+                                    candidate.offset_cents + reference_baseline,
+                                );
                                 self.spectrum_model
                                     .spectrum(frequency)
                                     .expect("finite MIDI candidate frequency")
@@ -418,10 +450,10 @@ impl AdaptiveRationalOptimizer {
             score: 0.0,
             stats: QuadraticStats::default(),
             bounds: AnchorBounds {
-                lower: -self.config.anchor_max_cents,
-                upper: self.config.anchor_max_cents,
+                lower: reference_baseline - self.config.anchor_max_cents,
+                upper: reference_baseline + self.config.anchor_max_cents,
             },
-            anchor: 0.0,
+            anchor: reference_baseline,
         }];
         let mut expanded =
             Vec::with_capacity(self.config.beam_width * self.config.candidates_per_note);
@@ -441,15 +473,16 @@ impl AdaptiveRationalOptimizer {
                             // A fallback outside an impossibly narrow candidate
                             // window retains the pre-existing explicit exception.
                             if !terms.fallback {
-                                let Some(bounds) = next
-                                    .bounds
-                                    .restrict(terms.base, self.config.max_deviation_cents + 1e-9)
-                                else {
+                                let Some(bounds) = next.bounds.restrict(
+                                    terms.base,
+                                    terms.baseline,
+                                    self.config.max_deviation_cents + 1e-9,
+                                ) else {
                                     continue;
                                 };
                                 next.bounds = bounds;
                             }
-                            next.stats.add(terms.base, terms.current);
+                            next.stats.add(terms.base, terms.baseline, terms.current);
                             next.anchor = next.bounds.minimize(next.stats, self.config.weights);
                             (next.costs.deviation, next.costs.movement) =
                                 next.stats.costs_at(next.anchor);
@@ -502,6 +535,19 @@ impl AdaptiveRationalOptimizer {
 }
 
 impl TuningStrategy for AdaptiveRationalOptimizer {
+    fn accepts(&self, midi_note: u8) -> bool {
+        self.scale
+            .as_ref()
+            .is_none_or(|scale| scale.accepts(midi_note))
+    }
+
+    fn output_note(&self, midi_note: u8) -> u8 {
+        self.scale
+            .as_ref()
+            .and_then(|scale| scale.output_note_for(midi_note))
+            .unwrap_or(midi_note)
+    }
+
     fn tune(&mut self, active_notes: &[ActiveNote]) -> Vec<TunedNote> {
         if active_notes.is_empty() {
             self.previous.clear();
@@ -567,6 +613,82 @@ impl TuningStrategy for AdaptiveRationalOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tuning::scala::{ScalaScale, ScalaTuning};
+
+    #[test]
+    fn scala_pitches_are_a_baseline_and_rational_optimizer_still_retunes_chord() {
+        let scale = ScalaScale::parse(
+            "near-JI\n12\n100.0\n200.0\n300.0\n380.0\n500.0\n600.0\n695.0\n800.0\n900.0\n1000.0\n1100.0\n1200.0\n",
+        )
+        .unwrap();
+        let mapping = ScalaTuning::new(scale, None, 60, 2.0).unwrap();
+        assert!((mapping.baseline_offset(64).unwrap() + 20.0).abs() < 1e-9);
+        assert!((mapping.baseline_offset(67).unwrap() + 5.0).abs() < 1e-9);
+        let config = OptimizerConfig {
+            anchor_mode: AnchorMode::Fixed,
+            memory_mode: MemoryMode::Relations,
+            ..OptimizerConfig::default()
+        };
+        let profile = SpectrumProfile::builtin(SpectrumPreset::Harmonic, config.roughness).unwrap();
+        let mut optimizer =
+            AdaptiveRationalOptimizer::with_profile_and_scale(config, profile, Some(mapping))
+                .unwrap();
+        let tuned = optimizer.tune(&notes(&[60, 64, 67]));
+        assert_eq!(ratios(&tuned), ["1/1", "5/4", "3/2"]);
+        assert!((tuned[1].cents_offset + 13.686).abs() < 0.01);
+        assert!((tuned[2].cents_offset - 1.955).abs() < 0.01);
+        assert!(!optimizer.relation_memory().entries().is_empty());
+    }
+
+    #[test]
+    fn scala_reference_uses_its_baseline_as_floating_anchor() {
+        let scale = ScalaScale::parse(
+            "near-JI\n12\n100.0\n200.0\n300.0\n380.0\n500.0\n600.0\n695.0\n800.0\n900.0\n1000.0\n1100.0\n1200.0\n",
+        )
+        .unwrap();
+        let mapping = ScalaTuning::new(scale, None, 60, 2.0).unwrap();
+        let config = OptimizerConfig::default();
+        let profile = SpectrumProfile::builtin(SpectrumPreset::Harmonic, config.roughness).unwrap();
+        let mut optimizer =
+            AdaptiveRationalOptimizer::with_profile_and_scale(config, profile, Some(mapping))
+                .unwrap();
+        let tuned = optimizer.tune(&notes(&[64, 67]));
+        assert_eq!(ratios(&tuned), ["1/1", "6/5"]);
+        assert!((tuned[0].cents_offset + 20.0).abs() < 2.0);
+        assert!((tuned[1].cents_offset + 5.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn non_octave_scala_file_still_produces_global_ji_assignment() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scales");
+        let scale = ScalaScale::load(&root.join("13 equal divisions of 3_1.scl")).unwrap();
+        let map = crate::tuning::scala::KeyboardMapping::load(
+            &root.join("13 equal divisions of 3_1.kbm"),
+        )
+        .unwrap();
+        let scala = ScalaTuning::new(scale, Some(map), 60, 2.0)
+            .unwrap()
+            .with_adaptive_headroom(2.0, 50.0)
+            .unwrap();
+        let baselines = [60, 65, 67].map(|note| scala.baseline_offset(note).unwrap());
+        assert_ne!(scala.output_note_for(65), Some(65));
+        let config = OptimizerConfig {
+            prime_limit: PrimeLimit::new(11).unwrap(),
+            max_deviation_cents: 50.0,
+            ..OptimizerConfig::default()
+        };
+        let profile = SpectrumProfile::builtin(SpectrumPreset::Harmonic, config.roughness).unwrap();
+        let mut optimizer =
+            AdaptiveRationalOptimizer::with_profile_and_scale(config, profile, Some(scala))
+                .unwrap();
+        let tuned = optimizer.tune(&notes(&[60, 65, 67]));
+        assert_eq!(tuned.len(), 3);
+        assert!(tuned.iter().any(|note| note.ratio != Ratio::ONE));
+        for (note, baseline) in tuned.iter().zip(baselines) {
+            assert!((note.cents_offset - baseline).abs() <= 50.0 + 1e-6);
+        }
+        assert!(!optimizer.relation_memory().entries().is_empty());
+    }
 
     fn notes(pitches: &[u8]) -> Vec<ActiveNote> {
         pitches
@@ -594,7 +716,11 @@ mod tests {
     #[test]
     fn memory_off_is_stateless_and_relations_mode_records_only_after_tune() {
         let chord = notes(&[60, 64, 67]);
-        let mut off = AdaptiveRationalOptimizer::default();
+        let off_config = OptimizerConfig {
+            memory_mode: MemoryMode::Off,
+            ..OptimizerConfig::default()
+        };
+        let mut off = AdaptiveRationalOptimizer::new(off_config).unwrap();
         off.tune(&chord);
         assert!(off.relation_memory().entries().is_empty());
 
@@ -608,7 +734,7 @@ mod tests {
         let mut no_memory_weight = config;
         no_memory_weight.weights.memory = 0.0;
         let mut baseline = AdaptiveRationalOptimizer::new(no_memory_weight).unwrap();
-        let mut off_weight = AdaptiveRationalOptimizer::default();
+        let mut off_weight = AdaptiveRationalOptimizer::new(off_config).unwrap();
         off_weight.tune(&chord);
         assert_eq!(
             off_weight.last_solution().unwrap().notes,
@@ -1128,15 +1254,15 @@ mod tests {
             (15.641287, Some(1.955001)),
             (-31.174094, None),
         ] {
-            stats.add(base, old);
+            stats.add(base, 0.0, old);
         }
         let bounds = AnchorBounds {
             lower: -35.0,
             upper: 35.0,
         }
-        .restrict(15.641287, 35.0)
+        .restrict(15.641287, 0.0, 35.0)
         .unwrap()
-        .restrict(-31.174094, 35.0)
+        .restrict(-31.174094, 0.0, 35.0)
         .unwrap();
         let anchor = bounds.minimize(stats, weights);
         let (a, b, c) = stats.coefficients(weights);
@@ -1162,7 +1288,7 @@ mod tests {
     #[test]
     fn anchor_clamps_and_zero_quadratic_prefers_zero() {
         let mut stats = QuadraticStats::default();
-        stats.add(0.0, Some(80.0));
+        stats.add(0.0, 0.0, Some(80.0));
         let weights = ScoreWeights::default();
         assert_eq!(
             AnchorBounds {
@@ -1173,7 +1299,7 @@ mod tests {
             5.0
         );
         stats = QuadraticStats::default();
-        stats.add(0.0, Some(-80.0));
+        stats.add(0.0, 0.0, Some(-80.0));
         assert_eq!(
             AnchorBounds {
                 lower: -5.0,
@@ -1216,7 +1342,7 @@ mod tests {
                 lower: -1.0,
                 upper: 1.0
             }
-            .restrict(5.0, 1.0)
+            .restrict(5.0, 0.0, 1.0)
             .is_none()
         );
     }

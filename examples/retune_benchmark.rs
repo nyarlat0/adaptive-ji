@@ -110,7 +110,7 @@ fn main() {
             count
         );
     }
-    println!("15 voices; K=8, beam=2048; construction/logging/MIDI excluded");
+    println!("15 voices; library K=8, beam=2048; construction/logging/MIDI excluded");
     let config = OptimizerConfig::default();
     for (name, preset) in [
         ("sine", SpectrumPreset::Sine),
@@ -135,4 +135,19 @@ fn main() {
     )
     .unwrap();
     compare("custom 32-partial", count, &notes, config, custom);
+
+    let cli_config = OptimizerConfig {
+        prime_limit: PrimeLimit::new(11).unwrap(),
+        max_deviation_cents: 50.0,
+        candidates_per_note: 8,
+        ..OptimizerConfig::default()
+    };
+    println!("v1.1 CLI defaults: 11-limit, 50c, K=8, memory=relations");
+    compare(
+        "v1.1 harmonic",
+        count,
+        &notes,
+        cli_config,
+        SpectrumProfile::builtin(SpectrumPreset::Harmonic, cli_config.roughness).unwrap(),
+    );
 }
