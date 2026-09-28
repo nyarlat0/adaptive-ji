@@ -661,11 +661,9 @@ mod tests {
     #[test]
     fn non_octave_scala_file_still_produces_global_ji_assignment() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scales");
-        let scale = ScalaScale::load(&root.join("13 equal divisions of 3_1.scl")).unwrap();
-        let map = crate::tuning::scala::KeyboardMapping::load(
-            &root.join("13 equal divisions of 3_1.kbm"),
-        )
-        .unwrap();
+        let scale = ScalaScale::load(&root.join("13_equal_div_3_1.scl")).unwrap();
+        let map = crate::tuning::scala::KeyboardMapping::load(&root.join("13_equal_div_3_1.kbm"))
+            .unwrap();
         let scala = ScalaTuning::new(scale, Some(map), 60, 2.0)
             .unwrap()
             .with_adaptive_headroom(2.0, 50.0)

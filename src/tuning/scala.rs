@@ -474,11 +474,8 @@ mod tests {
         let byz = ScalaTuning::new(byz, None, 60, 2.0).unwrap();
         assert_eq!(byz.offset(60), Some(0.0));
         assert!((byz.offset(72).unwrap()).abs() < 1e-8);
-        let scl = ScalaScale::load(&root.join("13-limit scale from Brendan Byrnes Operator.scl"))
-            .unwrap();
-        let kbm =
-            KeyboardMapping::load(&root.join("13-limit scale from Brendan Byrnes Operator.kbm"))
-                .unwrap();
+        let scl = ScalaScale::load(&root.join("lim_13_operator.scl")).unwrap();
+        let kbm = KeyboardMapping::load(&root.join("lim_13_operator.kbm")).unwrap();
         let tuning = ScalaTuning::new(scl, Some(kbm), 60, 2.0).unwrap();
         assert!((tuning.offset(66).unwrap() + 48.671).abs() < 0.02);
         assert_eq!(tuning.unreachable_keys(), 0);
@@ -492,8 +489,8 @@ mod tests {
     #[test]
     fn non_octave_scale_remaps_output_notes_and_reports_unreachable_edges() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("scales");
-        let scl = ScalaScale::load(&root.join("13 equal divisions of 3_1.scl")).unwrap();
-        let kbm = KeyboardMapping::load(&root.join("13 equal divisions of 3_1.kbm")).unwrap();
+        let scl = ScalaScale::load(&root.join("13_equal_div_3_1.scl")).unwrap();
+        let kbm = KeyboardMapping::load(&root.join("13_equal_div_3_1.kbm")).unwrap();
         let tuning = ScalaTuning::new(scl, Some(kbm), 60, 2.0).unwrap();
         assert_eq!(tuning.output_note_for(60), Some(60));
         assert_eq!(tuning.output_note_for(65), Some(67));
@@ -506,8 +503,8 @@ mod tests {
     #[test]
     fn tritave_map_keeps_middle_keyboard_range_with_two_semitone_bend() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("scales");
-        let scl = ScalaScale::load(&root.join("13 equal divisions of 3_1.scl")).unwrap();
-        let kbm = KeyboardMapping::load(&root.join("13 equal divisions of 3_1.kbm")).unwrap();
+        let scl = ScalaScale::load(&root.join("13_equal_div_3_1.scl")).unwrap();
+        let kbm = KeyboardMapping::load(&root.join("13_equal_div_3_1.kbm")).unwrap();
         let baseline = ScalaTuning::new(scl, Some(kbm), 60, 2.0).unwrap();
         // 107 fits its baseline pitch, but needs more bend room to guarantee JI.
         assert!(baseline.accepts(107));

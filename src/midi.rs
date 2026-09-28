@@ -574,10 +574,9 @@ mod tests {
         };
         let mapping = scala.then(|| {
             ScalaTuning::new(
-                ScalaScale::parse(include_str!("../scales/13 equal divisions of 3_1.scl")).unwrap(),
+                ScalaScale::parse(include_str!("../scales/13_equal_div_3_1.scl")).unwrap(),
                 Some(
-                    KeyboardMapping::parse(include_str!("../scales/13 equal divisions of 3_1.kbm"))
-                        .unwrap(),
+                    KeyboardMapping::parse(include_str!("../scales/13_equal_div_3_1.kbm")).unwrap(),
                 ),
                 60,
                 2.0,

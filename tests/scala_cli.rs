@@ -9,13 +9,12 @@ fn run(args: &[&str]) -> std::process::Output {
 
 #[test]
 fn auto_kbm_and_root_override_are_visible_without_alsa() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("scales/13-limit scale from Brendan Byrnes Operator.scl");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scales/lim_13_operator.scl");
     let path = path.to_str().unwrap();
     let automatic = run(&["--scale", path, "--scale-info"]);
     assert!(automatic.status.success());
     let text = String::from_utf8(automatic.stdout).unwrap();
-    assert!(text.contains("Operator.kbm"));
+    assert!(text.contains("lim_13_operator.kbm"));
     assert!(text.contains(" 66 ->  66   -48.671c"));
 
     let root = run(&["--scale", path, "--root-note", "D4", "--scale-info"]);
@@ -63,7 +62,7 @@ fn invalid_kbm_reports_file_error_before_opening_midi() {
 
 #[test]
 fn tritave_diagnostics_identify_full_map_edges_and_show_rejected_pitches() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scales/13 equal divisions of 3_1.scl");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scales/13_equal_div_3_1.scl");
     let kbm = path.with_extension("kbm");
     let output = run(&[
         "--scale",

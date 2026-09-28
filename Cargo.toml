@@ -13,3 +13,10 @@ log = "0.4"
 midir = "0.11"
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+alsa = "0.11"
+
+# Keep the ALSA timestamp fix reproducible; never patch the user's Cargo cache.
+[patch.crates-io]
+midir = { path = "vendor/midir" }

@@ -31,6 +31,16 @@ cargo install --path .
 adaptive-ji --input "KeyRig"
 ```
 
+В репозитории закреплён локальный патч `midir 0.11.0` в `vendor/midir`
+через `[patch.crates-io]`. Он устраняет падение входного ALSA-потока на
+`ev.get_time().unwrap()`: допустимые MIDI-события без real-time timestamp
+(например, с tick timestamp) получают резервное monotonic время приёма,
+а их MIDI bytes продолжают передаваться обработчику. Real-time timestamps
+сохраняются. Tuning/glide по-прежнему используют собственный monotonic clock
+адаптера; Scala-маппинг и настройки строя не изменены.
+Подробности патча: [vendor/midir/ADAPTIVE_JI_PATCH.md](vendor/midir/ADAPTIVE_JI_PATCH.md).
+Не нужно править файлы в `~/.cargo/registry`: обычная сборка использует патч.
+
 `--input` принимает индекс из `--list-inputs` (начиная с **0**), полное имя
 либо уникальную часть имени без учёта регистра. Полное совпадение приоритетнее
 частичного. Если совпадений несколько, используйте индекс. Несуществующий вход
@@ -138,7 +148,7 @@ undecimal-кандидаты вроде 11/8 действительно могл
 ```bash
 adaptive-ji --input "KeyRig" --scale scales/albionbyz.scl -v
 adaptive-ji --input "KeyRig" \
-  --scale "scales/13-limit scale from Brendan Byrnes Operator.scl" -v
+  --scale scales/lim_13_operator.scl -v
 adaptive-ji --input "KeyRig" --scale scales/albionbyz.scl --root-note D4 -v
 adaptive-ji --input "KeyRig" --scale some.scl --kbm custom.kbm -v
 adaptive-ji --scale-info --scale scales/albionbyz.scl
@@ -166,7 +176,7 @@ NoteOff, sustain и panic. Для adaptive коррекции резервиру
 физический диапазон подключённой клавиатуры. `--scale-info` показывает также
 недоступные клавиши, их требуемые частоты и отдельно пропуски `.kbm` (`x`).
 
-Например, `13 equal divisions of 3_1.scl` с одноимённой `.kbm` задаёт шаг
+Например, `13_equal_div_3_1.scl` с одноимённой `.kbm` задаёт шаг
 146.304231¢ и тритаву 1901.955001¢ на каждые 13 клавиш. При стандартных
 `--bend-range 2 --max-deviation 50` доступны входные MIDI **18–106**;
 39 недоступных номеров — **0–17 и 107–127**. Весь диапазон 36–96 работает
