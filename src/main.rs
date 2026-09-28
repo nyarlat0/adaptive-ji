@@ -33,8 +33,12 @@ struct Args {
     list_inputs: bool,
 
     /// Input port index, exact name, or unique case-insensitive name fragment
-    #[arg(long, required_unless_present_any = ["list_inputs", "scale_info"], conflicts_with_all = ["list_inputs", "scale_info"], value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(long, required_unless_present_any = ["virtual_input", "list_inputs", "scale_info"], conflicts_with_all = ["virtual_input", "list_inputs", "scale_info"], value_parser = clap::builder::NonEmptyStringValueParser::new())]
     input: Option<String>,
+
+    /// Receive MIDI from Ardour/ALSA through the virtual destination Adaptive JI In
+    #[arg(long, conflicts_with_all = ["input", "list_inputs", "scale_info"])]
+    virtual_input: bool,
 
     /// Import a Scala .scl as base pitches for the adaptive JI optimizer
     #[arg(long)]
@@ -326,12 +330,12 @@ fn main() -> anyhow::Result<()> {
             tick_ms: args.glide_tick_ms,
         };
         glide.validate().map_err(anyhow::Error::msg)?;
-        midi::run(
-            args.input.as_deref().expect("clap requires --input"),
-            args.bend_range,
-            tuning,
-            glide,
-        )
+        let source = if args.virtual_input {
+            midi::MidiInputSource::Virtual
+        } else {
+            midi::MidiInputSource::Physical(args.input.as_deref().expect("clap requires an input"))
+        };
+        midi::run_with_source(source, args.bend_range, tuning, glide)
     }
 }
 
@@ -339,6 +343,52 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use adaptive_ji::tuning::{ActiveNote, Ratio, candidates::CandidateGenerator};
+
+    #[test]
+    fn virtual_input_is_explicit_exclusive_and_preserves_tuning_defaults() {
+        let physical = Args::try_parse_from(["adaptive-ji", "--input", "KeyRig"]).unwrap();
+        let virtual_input = Args::try_parse_from(["adaptive-ji", "--virtual-input"]).unwrap();
+        assert_eq!(physical.input.as_deref(), Some("KeyRig"));
+        assert!(!physical.virtual_input);
+        assert!(virtual_input.virtual_input);
+        assert!(virtual_input.input.is_none());
+        assert_eq!(virtual_input.prime_limit, physical.prime_limit);
+        assert_eq!(virtual_input.memory_mode, physical.memory_mode);
+        assert_eq!(virtual_input.max_deviation, physical.max_deviation);
+        assert_eq!(virtual_input.glide_ms, physical.glide_ms);
+        assert_eq!(
+            virtual_input.bend_range.semitones(),
+            physical.bend_range.semitones()
+        );
+        assert_eq!(
+            Args::try_parse_from(["adaptive-ji", "--input", "0"])
+                .unwrap()
+                .input
+                .as_deref(),
+            Some("0")
+        );
+        assert!(Args::try_parse_from(["adaptive-ji"]).is_err());
+        assert!(Args::try_parse_from(["adaptive-ji", "--list-inputs"]).is_ok());
+        for diagnostic in ["--input", "--list-inputs", "--scale-info"] {
+            let mut arguments = vec!["adaptive-ji", "--virtual-input", diagnostic];
+            if diagnostic == "--input" {
+                arguments.push("KeyRig");
+            }
+            let error = Args::try_parse_from(arguments).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert!(error.to_string().contains("--virtual-input"));
+        }
+        let scala = Args::try_parse_from([
+            "adaptive-ji",
+            "--virtual-input",
+            "--scale",
+            "example.scl",
+            "--kbm",
+            "example.kbm",
+        ])
+        .unwrap();
+        assert!(scala.scale.is_some() && scala.kbm.is_some());
+    }
 
     #[test]
     fn version_11_cli_defaults_enable_exploratory_adaptive_memory() {

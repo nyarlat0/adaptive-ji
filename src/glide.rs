@@ -173,6 +173,12 @@ impl GlideEngine {
         self.voices.remove(&id);
     }
 
+    /// Reassert the last sent pitch after CC121 without changing the trajectory
+    /// or confusing duplicate-bend suppression on the next tick.
+    pub fn last_emitted_bend(&self, id: VoiceId) -> Option<u16> {
+        self.voices.get(&id).map(|state| state.last_bend)
+    }
+
     pub fn clear(&mut self) {
         self.voices.clear();
     }

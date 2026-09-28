@@ -3,7 +3,8 @@
 
 use std::{
     collections::HashSet,
-    process::{Child, Command},
+    io::Read,
+    process::{Child, Command, Stdio},
     sync::Mutex,
     sync::mpsc::{self, Receiver},
     thread,
@@ -70,21 +71,35 @@ fn last_bend(messages: &[Vec<u8>], channel: u8) -> u16 {
 fn actual_binary_routes_retunes_and_cleans_up_on_sigint() {
     let _serial = ALSA_TEST_LOCK.lock().unwrap();
     // Sequential runs keep the existing baseline regression and exercise the new default.
-    run_strategy("five-limit");
-    run_strategy("adaptive-fixed");
-    run_strategy("adaptive");
-    run_strategy("adaptive-zero");
+    run_strategy("five-limit", false);
+    run_strategy("adaptive-fixed", false);
+    run_strategy("adaptive", false);
+    run_strategy("adaptive-zero", false);
 }
 
-fn run_strategy(strategy: &str) {
+#[test]
+#[ignore = "requires /dev/snd/seq; run cargo test --test alsa_loopback -- --ignored"]
+fn actual_binary_virtual_input_is_a_destination_and_drops_both_ports_on_shutdown() {
+    let _serial = ALSA_TEST_LOCK.lock().unwrap();
+    run_strategy("adaptive", true);
+}
+
+fn run_strategy(strategy: &str, virtual_input: bool) {
     let source_name = format!(
         "adaptive-ji test keyboard {strategy} {}",
         std::process::id()
     );
-    let mut keyboard = MidiOutput::new(&source_name)
-        .unwrap()
-        .create_virtual(&source_name)
-        .unwrap();
+    let source = MidiOutput::new(&source_name).unwrap();
+    let existing_destinations: HashSet<_> = source
+        .ports()
+        .iter()
+        .map(|port| source.port_name(port).unwrap())
+        .collect();
+    let (keyboard, daw_sender) = if virtual_input {
+        (None, Some(source))
+    } else {
+        (Some(source.create_virtual(&source_name).unwrap()), None)
+    };
     let mut monitor = MidiInput::new("adaptive-ji test monitor").unwrap();
     monitor.ignore(Ignore::None);
     let existing: HashSet<_> = monitor
@@ -94,14 +109,12 @@ fn run_strategy(strategy: &str) {
         .collect();
     let mut app = RunningApp(
         Command::new(env!("CARGO_BIN_EXE_adaptive-ji"))
-            .args([
-                "--input",
-                &source_name,
-                "--bend-range",
-                "2",
-                "--glide-ms",
-                "0",
-            ])
+            .args(if virtual_input {
+                vec!["--virtual-input"]
+            } else {
+                vec!["--input", &source_name]
+            })
+            .args(["--bend-range", "2", "--glide-ms", "0"])
             // Omit the flag for adaptive to check the CLI default as well.
             .args(match strategy {
                 "five-limit" => vec!["--strategy", "five-limit"],
@@ -109,6 +122,7 @@ fn run_strategy(strategy: &str) {
                 "adaptive-zero" => vec!["--w-roughness", "0"],
                 _ => vec![],
             })
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
@@ -131,6 +145,7 @@ fn run_strategy(strategy: &str) {
         );
         thread::sleep(Duration::from_millis(10));
     };
+    let output_name = monitor.port_name(&output_port).unwrap();
     let (sender, receiver) = mpsc::channel();
     let _monitor_connection = monitor
         .connect(
@@ -142,6 +157,49 @@ fn run_strategy(strategy: &str) {
             (),
         )
         .unwrap();
+
+    let mut virtual_input_name = None;
+    let mut keyboard = if let Some(daw) = daw_sender {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let input_port = loop {
+            if let Some(port) = daw.ports().into_iter().find(|port| {
+                let name = daw.port_name(port).unwrap();
+                name.contains("Adaptive JI In") && !existing_destinations.contains(&name)
+            }) {
+                break port;
+            }
+            assert!(
+                app.0.try_wait().unwrap().is_none(),
+                "app exited during input startup"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "virtual MIDI destination did not appear"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let input_name = daw.port_name(&input_port).unwrap();
+        // midir lists only WRITE/SUBS_WRITE ports as output destinations and
+        // READ/SUBS_READ ports as input sources. Neither port is bidirectional.
+        assert!(
+            !daw.ports()
+                .iter()
+                .any(|port| daw.port_name(port).unwrap() == output_name)
+        );
+        let source_probe = MidiInput::new("adaptive-ji direction probe").unwrap();
+        assert!(
+            !source_probe
+                .ports()
+                .iter()
+                .any(|port| source_probe.port_name(port).unwrap() == input_name)
+        );
+        virtual_input_name = Some(input_name);
+        // This external subscription stands in for the Ardour RAW track output.
+        daw.connect(&input_port, "adaptive-ji test RAW track")
+            .unwrap()
+    } else {
+        keyboard.unwrap()
+    };
 
     // Port creation precedes input connection. Probe with a harmless CC until the
     // callback is ready, so the test never relies on an arbitrary startup sleep.
@@ -239,10 +297,11 @@ fn run_strategy(strategy: &str) {
     assert_eq!(restruck.last(), Some(&vec![0x91, 60, 100]));
     assert!(!restruck.iter().any(|message| message[0] == 0x92));
     keyboard.send(&[0xb0, 64, 0]).unwrap();
-    let pedal_up = receive_count(&receiver, 18);
+    let pedal_up = receive_count(&receiver, 19);
     assert_eq!(pedal_up[0], [0xb1, 64, 0]);
     assert_eq!(pedal_up[14], [0xbf, 64, 0]);
-    assert_eq!(pedal_up[15], encode_pitch_bend(2, 8192));
+    assert_eq!(pedal_up[15], [0x82, 64, 0]);
+    assert_eq!(pedal_up[16], encode_pitch_bend(2, 8192));
     assert!(!pedal_up.iter().any(|message| message[0] & 0xf0 == 0x90));
 
     assert!(
@@ -258,6 +317,7 @@ fn run_strategy(strategy: &str) {
     for channel in 0..=15 {
         assert!(cleanup.contains(&vec![0xb0 | channel, 64, 0]));
         assert!(cleanup.contains(&vec![0xb0 | channel, 123, 0]));
+        assert!(cleanup.contains(&vec![0xb0 | channel, 120, 0]));
     }
     for channel in 1..=15 {
         assert!(cleanup.contains(&encode_pitch_bend(channel, 8192).to_vec()));
@@ -273,6 +333,33 @@ fn run_strategy(strategy: &str) {
             "adaptive-ji did not exit after SIGINT"
         );
         thread::sleep(Duration::from_millis(10));
+    }
+    let mut startup = String::new();
+    app.0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut startup)
+        .unwrap();
+    if virtual_input {
+        assert!(startup.contains("MIDI input:  Adaptive JI In (virtual ALSA port)"));
+        assert!(startup.contains("MIDI output: Adaptive JI Out"));
+    }
+    let probe = MidiInput::new("adaptive-ji shutdown source probe").unwrap();
+    assert!(
+        !probe
+            .ports()
+            .iter()
+            .any(|port| probe.port_name(port).unwrap() == output_name)
+    );
+    if let Some(input_name) = virtual_input_name {
+        let probe = MidiOutput::new("adaptive-ji shutdown destination probe").unwrap();
+        assert!(
+            !probe
+                .ports()
+                .iter()
+                .any(|port| probe.port_name(port).unwrap() == input_name)
+        );
     }
 }
 

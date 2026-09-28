@@ -88,6 +88,19 @@ impl VoiceAllocator {
     }
 
     /// MIDI 1.0 has no note IDs; repeated keys are matched oldest-first per input channel.
+    /// Inspect the matching voice without consuming its FIFO entry. The output
+    /// layer must send its mapped NoteOff before committing the release.
+    pub fn next_release(&self, input_channel: u8, input_note: u8) -> Option<&Voice> {
+        let id = self
+            .pending
+            .get(&(input_channel, input_note))?
+            .front()
+            .copied()
+            .flatten()?;
+        self.voices.iter().find(|voice| voice.id == id)
+    }
+
+    /// Commit a physical key release after its output NoteOff has been sent.
     pub fn release_key(
         &mut self,
         input_channel: u8,

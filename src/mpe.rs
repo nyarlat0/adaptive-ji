@@ -1,16 +1,24 @@
-use std::time::Duration;
+use std::{convert::Infallible, time::Duration};
 
 use crate::{
     glide::{GlideConfig, GlideEngine, TargetUpdate},
     midi::MidiEvent,
     pitch_bend::{BendRange, CENTER, cents_to_pitch_bend, encode_pitch_bend},
     tuning::{ActiveNote, TuningStrategy},
-    voice::{KeyRelease, Voice, VoiceAllocator, note_name},
+    voice::{Voice, VoiceAllocator, VoiceState, note_name},
 };
 
 pub type MidiMessage = [u8; 3];
 
-/// MIDI-independent state machine: the transport only sends the returned messages in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanicKind {
+    AllSoundOff,
+    AllNotesOff,
+    Shutdown,
+}
+
+/// MIDI-independent state machine with a fallible output sink for the live
+/// transport and a collecting sink for deterministic tests/embedders.
 pub struct MpeProcessor<T> {
     tuning: T,
     allocator: VoiceAllocator,
@@ -60,6 +68,25 @@ impl<T: TuningStrategy> MpeProcessor<T> {
     }
 
     pub fn process_at(&mut self, event: MidiEvent, now: Duration) -> Vec<MidiMessage> {
+        // In-memory sink for embedders/tests. The live transport uses
+        // process_at_to so releases are committed only after real send calls.
+        let mut output = Vec::with_capacity(32);
+        self.process_at_to(event, now, |message| {
+            output.push(*message);
+            Ok::<_, Infallible>(())
+        })
+        .unwrap();
+        output
+    }
+
+    /// Deliver one event in order. A failed send retains any not-yet-terminated
+    /// voice identities for the transport's fatal panic/retry path.
+    pub fn process_at_to<E>(
+        &mut self,
+        event: MidiEvent,
+        now: Duration,
+        mut send: impl FnMut(&MidiMessage) -> Result<(), E>,
+    ) -> Result<(), E> {
         let mut output = Vec::with_capacity(32);
         match event {
             MidiEvent::NoteOn {
@@ -72,7 +99,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
                 note,
                 velocity: 0,
             } => {
-                self.note_off(channel, note, 0, now, &mut output);
+                return self.note_off(channel, note, 0, now, &mut send);
             }
             MidiEvent::NoteOn {
                 channel,
@@ -85,7 +112,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
                         "NoteOn ignored: {} input={note} is unmapped or outside the Scala output range; see --scale-info",
                         note_name(note)
                     );
-                    return output;
+                    return Ok(());
                 }
                 let output_note = self.tuning.output_note(note);
                 let Some(voice) =
@@ -96,7 +123,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
                         "No free MPE channel (15 voices); ignoring NoteOn {} input={note}",
                         note_name(note)
                     );
-                    return output;
+                    return Ok(());
                 };
                 log::info!(
                     "NOTE ON  {:<4} input={note} voice={} ch={}",
@@ -114,64 +141,55 @@ impl<T: TuningStrategy> MpeProcessor<T> {
                 note,
                 velocity,
             } => {
-                self.note_off(channel, note, velocity, now, &mut output);
+                return self.note_off(channel, note, velocity, now, &mut send);
             }
             MidiEvent::ControlChange {
                 controller, value, ..
             } => {
-                // Explicit panic controls must also clear allocator state.
-                if matches!(controller, 120 | 123) {
-                    output.extend(self.shutdown());
-                } else if controller == 64 {
-                    let was_down = self.sustain_down;
-                    self.sustain_down = value >= 64;
-                    // The pedal state must reach the synth before any released
-                    // channel is centered or reused.
-                    output.extend((1..=15).map(|channel| [0xb0 | channel, 64, value]));
-                    if was_down && !self.sustain_down {
-                        log::info!("PEDAL UP");
-                        let released = self.allocator.release_sustained();
-                        for voice in &released {
-                            self.glide.remove(voice.id);
-                            log::info!(
-                                "VOICE RELEASE {:<4} voice={} ch={}",
-                                note_name(voice.input_note),
-                                voice.id,
-                                voice.output_channel + 1
-                            );
-                            output.push(encode_pitch_bend(voice.output_channel, CENTER));
+                match controller {
+                    120 => return self.panic_output(PanicKind::AllSoundOff, send),
+                    123 => return self.panic_output(PanicKind::AllNotesOff, send),
+                    121 => return self.release_pedal(0, true, now, &mut send),
+                    64 if value < 64 => return self.release_pedal(value, false, now, &mut send),
+                    64 => {
+                        for channel in 1..=15 {
+                            send(&[0xb0 | channel, 64, value])?;
                         }
-                        if !released.is_empty() {
-                            self.retune(now, &mut output);
+                        if !self.sustain_down {
+                            log::info!("PEDAL DOWN");
                         }
-                    } else if !was_down && self.sustain_down {
-                        log::info!("PEDAL DOWN");
+                        self.sustain_down = true;
+                        return Ok(());
                     }
-                    return output;
+                    _ => {}
                 }
                 // Free member channels receive other controllers too.
                 output.extend((1..=15).map(|channel| [0xb0 | channel, controller, value]));
             }
         }
-        output
+        for message in output {
+            send(&message)?;
+        }
+        Ok(())
     }
 
-    fn note_off(
+    fn note_off<E>(
         &mut self,
         channel: u8,
         note: u8,
         velocity: u8,
         now: Duration,
-        output: &mut Vec<MidiMessage>,
-    ) {
-        let Some(release) = self.allocator.release_key(channel, note, self.sustain_down) else {
+        send: &mut impl FnMut(&MidiMessage) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Some(voice) = self.allocator.next_release(channel, note).cloned() else {
+            // Consume an ignored NoteOn's FIFO placeholder as before.
+            self.allocator.release_key(channel, note, self.sustain_down);
             log::debug!("Ignored NoteOff input={note} input_ch={}", channel + 1);
-            return;
+            return Ok(());
         };
-        let (voice, sustained) = match release {
-            KeyRelease::Released(voice) => (voice, false),
-            KeyRelease::Sustained(voice) => (voice, true),
-        };
+        send(&[0x80 | voice.output_channel, voice.output_note, velocity])?;
+        let sustained = self.sustain_down;
+        self.allocator.release_key(channel, note, sustained);
         log::info!(
             "NOTE OFF {:<4} voice={} ch={}{}",
             note_name(note),
@@ -179,12 +197,105 @@ impl<T: TuningStrategy> MpeProcessor<T> {
             voice.output_channel + 1,
             if sustained { " sustained" } else { "" }
         );
-        output.push([0x80 | voice.output_channel, voice.output_note, velocity]);
         if !sustained {
             self.glide.remove(voice.id);
-            output.push(encode_pitch_bend(voice.output_channel, CENTER));
-            self.retune(now, output);
+            send(&encode_pitch_bend(voice.output_channel, CENTER))?;
+            let mut output = Vec::new();
+            self.retune(now, &mut output);
+            for message in output {
+                send(&message)?;
+            }
         }
+        Ok(())
+    }
+
+    /// Shared CC64-up / CC121 release path. Physically held voices keep their
+    /// channels and glides; sustained voices receive explicit mapped NoteOffs.
+    fn release_pedal<E>(
+        &mut self,
+        value: u8,
+        reset_controllers: bool,
+        now: Duration,
+        send: &mut impl FnMut(&MidiMessage) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let released: Vec<_> = self
+            .allocator
+            .voices()
+            .iter()
+            .filter(|voice| voice.state == VoiceState::ReleasedSustained)
+            .cloned()
+            .collect();
+        for channel in 1..=15 {
+            send(&[0xb0 | channel, 64, value])?;
+        }
+        for voice in &released {
+            send(&[0x80 | voice.output_channel, voice.output_note, 0])?;
+        }
+        if reset_controllers {
+            log::info!(
+                "RESET input=CC121 releasing={} held={}",
+                released.len(),
+                self.allocator.state_counts().0
+            );
+            // Recover stray downstream voices on channels that have no held
+            // key, even if local bookkeeping is empty. Held channels must not
+            // receive All Sound Off during a controller-only reset.
+            for channel in 1..=15 {
+                if !self
+                    .allocator
+                    .voices()
+                    .iter()
+                    .any(|voice| voice.output_channel == channel && voice.state == VoiceState::Held)
+                {
+                    send(&[0xb0 | channel, 120, 0])?;
+                }
+            }
+            for channel in 1..=15 {
+                send(&[0xb0 | channel, 121, 0])?;
+            }
+            // CC121 resets pitch bend in the receiver. Restore the configured
+            // sensitivity and current emitted bend for held voices, including
+            // static ones whose glide would otherwise emit nothing afterward.
+            for voice in self
+                .allocator
+                .voices()
+                .iter()
+                .filter(|v| v.state == VoiceState::Held)
+            {
+                for message in self.bend_range.rpn(voice.output_channel) {
+                    send(&message)?;
+                }
+                if let Some(bend) = self.glide.last_emitted_bend(voice.id) {
+                    send(&encode_pitch_bend(voice.output_channel, bend))?;
+                }
+            }
+        }
+        for voice in &released {
+            send(&encode_pitch_bend(voice.output_channel, CENTER))?;
+        }
+        if self.sustain_down {
+            log::info!("PEDAL UP");
+        }
+        self.sustain_down = false;
+        self.allocator.release_sustained();
+        for voice in &released {
+            self.glide.remove(voice.id);
+            log::info!(
+                "VOICE RELEASE {} voice={} ch={} output_note={}",
+                note_name(voice.input_note),
+                voice.id,
+                voice.output_channel + 1,
+                voice.output_note
+            );
+        }
+        if !released.is_empty() {
+            let mut output = Vec::new();
+            self.retune(now, &mut output);
+            for message in output {
+                send(&message)?;
+            }
+        }
+        Ok(())
     }
 
     fn retune(&mut self, now: Duration, output: &mut Vec<MidiMessage>) {
@@ -281,25 +392,91 @@ impl<T: TuningStrategy> MpeProcessor<T> {
     }
 
     pub fn shutdown(&mut self) -> Vec<MidiMessage> {
-        self.glide.clear();
-        let mut output = Vec::with_capacity(62);
+        let mut output = Vec::with_capacity(78);
+        self.panic_output(PanicKind::Shutdown, |message| {
+            output.push(*message);
+            Ok::<_, Infallible>(())
+        })
+        .unwrap();
+        output
+    }
+
+    /// One output-side panic for CC120, CC123 and shutdown/fatal cleanup.
+    /// Try every termination message even if a send fails. Keep voice/FIFO
+    /// bookkeeping on failure so another attempt can still address each voice.
+    pub fn panic_output<E>(
+        &mut self,
+        kind: PanicKind,
+        mut send: impl FnMut(&MidiMessage) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let (held, sustained) = self.allocator.state_counts();
+        let input = match kind {
+            PanicKind::AllSoundOff => "CC120",
+            PanicKind::AllNotesOff => "CC123",
+            PanicKind::Shutdown => "shutdown",
+        };
+        log::info!(
+            "PANIC input={input} active={} held={held} sustained={sustained}",
+            held + sustained
+        );
+        let mut error = None;
+        let mut attempt = |message| {
+            if let Err(failure) = send(&message) {
+                error.get_or_insert(failure);
+            }
+        };
+        if kind == PanicKind::AllSoundOff {
+            for channel in 0..=15 {
+                attempt([0xb0 | channel, 120, 0]);
+            }
+        }
         for voice in self.allocator.voices() {
-            output.push([0x80 | voice.output_channel, voice.output_note, 0]);
+            log::info!(
+                "PANIC NOTE_OFF ch={} note={} voice={}",
+                voice.output_channel + 1,
+                voice.output_note,
+                voice.id
+            );
+            attempt([0x80 | voice.output_channel, voice.output_note, 0]);
         }
         for channel in 0..=15 {
             // All Notes Off alone does not silence sustain-held notes.
-            output.push([0xb0 | channel, 64, 0]);
+            attempt([0xb0 | channel, 64, 0]);
         }
         for channel in 0..=15 {
-            output.push([0xb0 | channel, 123, 0]);
+            attempt([0xb0 | channel, 123, 0]);
         }
+        if kind != PanicKind::AllSoundOff {
+            for channel in 0..=15 {
+                attempt([0xb0 | channel, 120, 0]);
+            }
+        }
+        log::info!("PANIC broadcast CC64=0 CC123=0 CC120=0 ch=1..16");
+        // Do not sweep pitch after a failed termination. Cancel scheduling, but
+        // retain mapped identities and pending releases for fatal cleanup/retry.
+        if let Some(error) = error {
+            self.glide.clear();
+            log::warn!(
+                "PANIC incomplete; retaining {} voices for retry",
+                held + sustained
+            );
+            return Err(error);
+        }
+        let mut error = None;
         for channel in 1..=15 {
-            output.push(encode_pitch_bend(channel, CENTER));
+            if let Err(failure) = send(&encode_pitch_bend(channel, CENTER)) {
+                error.get_or_insert(failure);
+            }
+        }
+        self.glide.clear();
+        if let Some(error) = error {
+            return Err(error);
         }
         self.allocator.clear();
         self.sustain_down = false;
         self.tuning.tune(&[]);
-        output
+        log::info!("PANIC sent; local voices=0 held=0 sustained=0 (no downstream acknowledgement)");
+        Ok(())
     }
 }
 
@@ -333,6 +510,240 @@ mod tests {
 
     fn processor() -> MpeProcessor<FiveLimitLowestRoot> {
         MpeProcessor::new(FiveLimitLowestRoot, "2".parse().unwrap())
+    }
+
+    fn remapped_processor() -> MpeProcessor<crate::tuning::AdaptiveRationalOptimizer> {
+        // D3/input 50 maps to output 60, and input 51 maps to output 62.
+        let scale = ScalaScale::parse("wide\n2\n150.0\n1200.0\n").unwrap();
+        scala_processor(ScalaTuning::new(scale, None, 48, 2.0).unwrap())
+    }
+
+    fn controller(number: u8) -> MidiEvent {
+        MidiEvent::ControlChange {
+            channel: 0,
+            controller: number,
+            value: 0,
+        }
+    }
+
+    #[test]
+    fn panics_explicitly_terminate_all_mapped_held_and_sustained_voices() {
+        for kind in [
+            PanicKind::AllNotesOff,
+            PanicKind::AllSoundOff,
+            PanicKind::Shutdown,
+        ] {
+            let mut processor = remapped_processor();
+            processor.process(on(50));
+            processor.process(pedal(127));
+            processor.process(off(50));
+            processor.process(on(50));
+            let voices = processor.voices().to_vec();
+            assert_eq!(processor.allocator.state_counts(), (1, 1));
+            let mut messages = Vec::new();
+            processor
+                .panic_output(kind, |message| {
+                    messages.push(*message);
+                    Ok::<_, Infallible>(())
+                })
+                .unwrap();
+            for voice in voices {
+                assert_eq!(voice.output_note, 60);
+                let off = [0x80 | voice.output_channel, voice.output_note, 0];
+                let off_index = messages.iter().position(|message| *message == off).unwrap();
+                let center_index = messages
+                    .iter()
+                    .position(|message| *message == encode_pitch_bend(voice.output_channel, CENTER))
+                    .unwrap();
+                assert!(off_index < center_index);
+                assert!(!messages.contains(&[0x80 | voice.output_channel, 50, 0]));
+            }
+            if kind == PanicKind::AllSoundOff {
+                assert_eq!(messages[0], [0xb0, 120, 0]);
+            } else {
+                assert_eq!(&messages[..2], &[[0x81, 60, 0], [0x82, 60, 0]]);
+            }
+            for channel in 1..=15 {
+                for cc in [64, 120, 123] {
+                    let index = messages
+                        .iter()
+                        .position(|msg| *msg == [0xb0 | channel, cc, 0])
+                        .unwrap();
+                    let center = messages
+                        .iter()
+                        .position(|msg| *msg == encode_pitch_bend(channel, CENTER))
+                        .unwrap();
+                    assert!(index < center);
+                }
+            }
+            assert!(processor.voices().is_empty());
+            assert!(!processor.sustain_down);
+            assert!(processor.process(off(50)).is_empty());
+            assert!(processor.next_glide_deadline().is_none());
+        }
+    }
+
+    #[test]
+    fn panic_with_empty_bookkeeping_kills_untracked_downstream_voices() {
+        for cc in [120, 121, 123] {
+            let mut processor = processor();
+            // Simulate a desynchronized synth, including one that ignores CC123.
+            let mut sounding_channels: std::collections::BTreeSet<_> = (1..=15).collect();
+            processor
+                .process_at_to(controller(cc), Duration::ZERO, |message| {
+                    if message[0] & 0xf0 == 0xb0 && message[1] == 120 && message[2] == 0 {
+                        sounding_channels.remove(&(message[0] & 0x0f));
+                    }
+                    Ok::<_, Infallible>(())
+                })
+                .unwrap();
+            assert!(sounding_channels.is_empty());
+            assert!(processor.voices().is_empty());
+            assert!(processor.tick_at(Duration::from_secs(1)).is_empty());
+        }
+    }
+
+    #[test]
+    fn pedal_up_and_reset_controllers_release_mapped_sustained_voices_only() {
+        for event in [pedal(0), controller(121)] {
+            let mut processor = remapped_processor();
+            processor.process(on(50));
+            processor.process(on(51));
+            processor.process(pedal(127));
+            processor.process(off(50));
+            let held_id = processor.voices()[1].id;
+            let messages = processor.process(event);
+            assert_eq!(messages[14], [0xbf, 64, 0]);
+            assert_eq!(messages[15], [0x81, 60, 0]);
+            let centered = messages
+                .iter()
+                .position(|msg| *msg == encode_pitch_bend(1, CENTER))
+                .unwrap();
+            assert!(centered > 15);
+            assert!(
+                !messages
+                    .iter()
+                    .any(|msg| msg[0] == 0x82 || msg[0] & 0xf0 == 0x90)
+            );
+            assert_eq!(processor.voices().len(), 1);
+            assert_eq!(processor.voices()[0].id, held_id);
+            assert_eq!(processor.voices()[0].state, VoiceState::Held);
+            assert!(!processor.sustain_down);
+            assert_eq!(processor.process(off(51))[0], [0x82, 62, 45]);
+        }
+    }
+
+    #[test]
+    fn reset_controllers_restores_held_bends_without_retriggering_or_restarting_glide() {
+        for duration_ms in [0, 35] {
+            let mut processor = MpeProcessor::with_glide(
+                FiveLimitLowestRoot,
+                "2".parse().unwrap(),
+                GlideConfig {
+                    duration_ms,
+                    tick_ms: 5,
+                },
+            );
+            processor.process_at(on(64), ms(0));
+            processor.process_at(on(60), ms(1));
+            processor.tick_at(ms(11));
+            let voice_id = processor.voices()[0].id;
+            let expected_bend = processor.glide.last_emitted_bend(voice_id).unwrap();
+            assert_ne!(expected_bend, CENTER);
+            let deadline = processor.next_glide_deadline();
+            let messages = processor.process_at(controller(121), ms(12));
+            for channel in 1..=15 {
+                assert!(messages.contains(&[0xb0 | channel, 121, 0]));
+            }
+            assert!(messages.contains(&encode_pitch_bend(1, expected_bend)));
+            assert!(
+                !messages
+                    .iter()
+                    .any(|msg| matches!(msg[0] & 0xf0, 0x80 | 0x90))
+            );
+            assert_eq!(processor.next_glide_deadline(), deadline);
+            assert_eq!(processor.voices().len(), 2);
+            if duration_ms > 0 {
+                assert_eq!(processor.tick_at(ms(100)), [encode_pitch_bend(1, 7631)]);
+            }
+            assert!(!messages.contains(&[0xb1, 120, 0]));
+            assert!(!messages.contains(&[0xb2, 120, 0]));
+            assert!(messages.contains(&[0xb3, 120, 0]));
+        }
+    }
+
+    #[test]
+    fn failed_panic_retains_mapped_bookkeeping_and_attempts_all_termination_channels() {
+        let mut processor = remapped_processor();
+        processor.process(on(50));
+        processor.process(on(51));
+        let mut attempted = Vec::new();
+        let error = processor.process_at_to(controller(123), Duration::ZERO, |message| {
+            attempted.push(*message);
+            if *message == [0x81, 60, 0] {
+                Err("simulated send failure")
+            } else {
+                Ok(())
+            }
+        });
+        assert!(error.is_err());
+        assert_eq!(processor.voices().len(), 2);
+        assert!(processor.allocator.next_release(0, 50).is_some());
+        assert!(attempted.contains(&[0x82, 62, 0]));
+        assert!(attempted.contains(&[0xbf, 120, 0]));
+        assert!(!attempted.iter().any(|msg| msg[0] & 0xf0 == 0xe0));
+        assert!(processor.next_glide_deadline().is_none());
+        let cleanup = processor.shutdown();
+        assert!(cleanup.contains(&[0x81, 60, 0]));
+        assert!(cleanup.contains(&[0x82, 62, 0]));
+        assert!(processor.voices().is_empty());
+    }
+
+    #[test]
+    fn failed_note_off_and_pedal_release_keep_voice_identity_for_fatal_panic() {
+        for sustained in [false, true] {
+            let mut processor = remapped_processor();
+            processor.process(on(50));
+            if sustained {
+                processor.process(pedal(127));
+                processor.process(off(50));
+            }
+            let event = if sustained { pedal(0) } else { off(50) };
+            assert!(
+                processor
+                    .process_at_to(event, Duration::ZERO, |message| {
+                        if message[0] == 0x81 { Err(()) } else { Ok(()) }
+                    })
+                    .is_err()
+            );
+            assert_eq!(processor.voices().len(), 1);
+            if !sustained {
+                assert!(processor.allocator.next_release(0, 50).is_some());
+            }
+            assert!(processor.shutdown().contains(&[0x81, 60, 0]));
+        }
+    }
+
+    #[test]
+    fn repeated_loop_panics_clear_all_voices_and_rejected_note_fifo_entries() {
+        let mut processor = remapped_processor();
+        for cc in [123, 120, 123, 123, 120] {
+            processor.process(pedal(127));
+            for _ in 0..15 {
+                processor.process(on(50));
+            }
+            assert!(processor.process(on(50)).is_empty()); // rejected 16th NoteOn
+            processor.process(off(50)); // one sustained voice + 14 held
+            let messages = processor.process(controller(cc));
+            for channel in 1..=15 {
+                assert!(messages.contains(&[0x80 | channel, 60, 0]));
+            }
+            assert!(processor.voices().is_empty());
+            processor.process(on(50));
+            assert_eq!(processor.process(off(50))[0], [0x81, 60, 45]);
+            assert!(processor.voices().is_empty());
+            assert!(processor.process(off(50)).is_empty());
+        }
     }
 
     #[test]
@@ -645,7 +1056,8 @@ mod tests {
             &up[..15],
             &(1..=15).map(|ch| [0xb0 | ch, 64, 0]).collect::<Vec<_>>()
         );
-        assert_eq!(up[15], encode_pitch_bend(2, CENTER));
+        assert_eq!(up[15], [0x82, 64, 0]);
+        assert_eq!(up[16], encode_pitch_bend(2, CENTER));
         assert!(!up.iter().any(|msg| msg[0] & 0xf0 == 0x90));
         assert_eq!(processor.voices().len(), 2);
         assert!(
@@ -696,9 +1108,11 @@ mod tests {
             2
         );
         let up = processor.process(pedal(0));
-        assert_eq!(up.len(), 17);
-        assert_eq!(up[15], encode_pitch_bend(1, CENTER));
-        assert_eq!(up[16], encode_pitch_bend(2, CENTER));
+        assert_eq!(up.len(), 19);
+        assert_eq!(up[15], [0x81, 60, 0]);
+        assert_eq!(up[16], [0x82, 60, 0]);
+        assert_eq!(up[17], encode_pitch_bend(1, CENTER));
+        assert_eq!(up[18], encode_pitch_bend(2, CENTER));
         assert!(processor.voices().is_empty());
     }
 
@@ -717,7 +1131,7 @@ mod tests {
         assert!(processor.process(on(75)).is_empty());
         assert!(processor.process(off(75)).is_empty());
         let up = processor.process(pedal(0));
-        assert_eq!(up.len(), 30);
+        assert_eq!(up.len(), 45);
         assert!(processor.voices().is_empty());
         assert_eq!(processor.process(on(76)).last(), Some(&[0x91, 76, 100]));
     }
@@ -768,7 +1182,8 @@ mod tests {
             assert!((voice.cents_offset - offset).abs() < 1e-9);
         }
         let up = processor.process(pedal(0));
-        assert_eq!(up[15], encode_pitch_bend(1, CENTER));
+        assert_eq!(up[15], [0x81, 60, 0]);
+        assert_eq!(up[16], encode_pitch_bend(1, CENTER));
         assert_eq!(processor.voices().len(), 2);
         assert!((processor.voices()[0].cents_offset - before[1]).abs() < 2.0);
         assert!((processor.voices()[1].cents_offset - before[2]).abs() < 2.0);
@@ -861,7 +1276,8 @@ mod tests {
         assert_eq!(processor.tick_at(ms(8))[0][0], 0xe1);
         let up = processor.process_at(pedal(0), ms(9));
         assert_eq!(up[0], [0xb1, 64, 0]);
-        assert_eq!(up[15], encode_pitch_bend(1, CENTER));
+        assert_eq!(up[15], [0x81, 64, 0]);
+        assert_eq!(up[16], encode_pitch_bend(1, CENTER));
         assert!(processor.tick_at(ms(100)).iter().all(|msg| msg[0] != 0xe1));
         assert_eq!(processor.next_glide_deadline(), None);
     }
