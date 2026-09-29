@@ -176,10 +176,34 @@ pub(super) fn create(
             egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("adaptive-ji — MPE note effect");
             ui.label(match draft.live.attack_mode { AttackMode::Immediate => "Активный режим: немедленная атака в базовом строе", AttackMode::Tuned => "Активный режим: атака после подбора JI (переменная задержка)" });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("PANIC").clicked() { control.panic.store(true,Ordering::Release); }
                 if ui.button("Reload current settings").clicked() { draft.value = serde_json::to_value(&*params.settings.lock().unwrap()).unwrap(); }
+                let apply = egui::Button::new(egui::RichText::new("Validate and apply").color(egui::Color32::WHITE).strong())
+                    .fill(egui::Color32::from_rgb(32, 120, 64));
+                if ui.add_enabled(!control.busy.load(Ordering::Acquire), apply).clicked() {
+                    match serde_json::from_value::<EngineSettings>(draft.value.clone()).and_then(|settings| settings.prepare().map(|_|settings).map_err(serde::de::Error::custom)) {
+                        Ok(settings) => {
+                            control.busy.store(true,Ordering::Release);
+                            executor.execute_background(settings);
+                            setter.begin_set_parameter(&params.revision);
+                            setter.set_parameter(&params.revision, (params.revision.value() + 1) % 1024);
+                            setter.end_set_parameter(&params.revision);
+                            draft.message.clear();
+                        }
+                        Err(error) => draft.message = error.to_string(),
+                    }
+                }
+                if ui.button("Reset to defaults").on_hover_text("Сбросить настройки редактора, Scala и custom spectrum. Для применения нажмите Validate and apply.").clicked() {
+                    draft.value = serde_json::to_value(EngineSettings::default()).unwrap();
+                    draft.scl.clear();
+                    draft.kbm.clear();
+                    draft.spectrum.clear();
+                    draft.message = "Дефолтные настройки загружены в редактор. Нажмите Validate and apply для применения.".into();
+                }
             });
+            ui.label(&draft.message);
+            ui.label(control.message.lock().unwrap().as_str());
             egui::ScrollArea::vertical().show(ui, |ui| {
                 live_notes(ui, &draft.live);
                 ui.separator();
@@ -194,7 +218,7 @@ pub(super) fn create(
                 draft.value["attack_mode"] = attack.into();
                 ui.label("Ждать JI: target Bend → NoteOn, без glide при атаке. Задержка зависит от расчёта.");
                 ui.label("Короткая нота, отпущенная до расчёта без педали, не прозвучит.");
-                ui.label("Выберите режим и нажмите Validate and apply ниже. Apply снимает текущие ноты.");
+                ui.label("Выберите режим и нажмите зелёную Validate and apply сверху. Apply снимает текущие ноты.");
                 if let Some(map) = draft.value.as_object_mut() {
                     for (key,value) in map.iter_mut().filter(|(k,_)| !matches!(k.as_str(),"scale"|"custom_spectrum_toml"|"attack_mode")) {
                         ui.collapsing(key, |ui| fields(ui,value));
@@ -222,21 +246,6 @@ pub(super) fn create(
                     match std::fs::read_to_string(&draft.spectrum) {Ok(text)=>draft.value["custom_spectrum_toml"]=text.into(),Err(e)=>draft.message=e.to_string()}
                 }
                 if ui.button("Use built-in spectrum").clicked() {draft.value["custom_spectrum_toml"]=serde_json::Value::Null;}
-                if ui.add_enabled(!control.busy.load(Ordering::Acquire), egui::Button::new("Validate and apply")).clicked() {
-                    match serde_json::from_value::<EngineSettings>(draft.value.clone()).and_then(|settings| settings.prepare().map(|_|settings).map_err(serde::de::Error::custom)) {
-                        Ok(settings) => {
-                            control.busy.store(true,Ordering::Release);
-                            executor.execute_background(settings);
-                            setter.begin_set_parameter(&params.revision);
-                            setter.set_parameter(&params.revision, (params.revision.value() + 1) % 1024);
-                            setter.end_set_parameter(&params.revision);
-                            draft.message.clear();
-                        }
-                        Err(error) => draft.message = error.to_string(),
-                    }
-                }
-                ui.label(&draft.message);
-                ui.label(control.message.lock().unwrap().as_str());
                 ui.label("Set the receiving synth to MPE and the same bend range. No audio is generated.");
             });
         });

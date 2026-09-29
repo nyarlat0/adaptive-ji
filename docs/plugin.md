@@ -68,7 +68,10 @@ attack mode, offline NoteOn starts at the input sample with the solved pitch.
 ## Editor and project state
 
 Open the custom editor. Expand configuration groups, edit values, then press
-**Validate and apply**. Applying releases current notes and swaps a prepared
+the green **Validate and apply** button in the top toolbar, next to **Reload
+current settings**. **Reset to defaults** in the same toolbar restores the draft's
+default settings and clears imported Scala/custom spectrum data and import paths;
+press **Validate and apply** to activate those defaults. Applying releases current notes and swaps a prepared
 configuration at a processing-block boundary. Parameters are deliberately
 non-automatable configuration; the host's configuration-revision parameter
 marks editor changes, not a musical automation lane.
