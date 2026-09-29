@@ -10,6 +10,15 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Plugin attack policy. Both modes keep full search off the realtime thread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttackMode {
+    #[default]
+    Immediate,
+    Tuned,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddedScale {
@@ -29,6 +38,9 @@ pub struct EngineSettings {
     pub scale: Option<EmbeddedScale>,
     pub glide: GlideConfig,
     pub bend_range: f64,
+    /// Missing in older projects: retain their immediate/base attacks.
+    #[serde(default)]
+    pub attack_mode: AttackMode,
 }
 
 impl Default for EngineSettings {
@@ -45,6 +57,7 @@ impl Default for EngineSettings {
             scale: None,
             glide: GlideConfig::default(),
             bend_range: 2.0,
+            attack_mode: AttackMode::default(),
         }
     }
 }
@@ -60,6 +73,7 @@ pub struct PreparedSettings {
     pub base: [Option<BasePitch>; 128],
     pub bend_range: BendRange,
     pub glide: GlideConfig,
+    pub attack_mode: AttackMode,
 }
 
 impl EngineSettings {
@@ -117,6 +131,7 @@ impl EngineSettings {
             base,
             bend_range: range,
             glide: self.glide,
+            attack_mode: self.attack_mode,
         })
     }
 }

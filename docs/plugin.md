@@ -35,15 +35,35 @@ its pitch-bend range equal to adaptive-ji (default ±2 semitones). RPN sensitivi
 is also emitted. Disable/reduce additional synth bend smoothing if using the
 default 35 ms adapter glide to avoid double smoothing.
 
-NoteOn attacks immediately at Scala/12-TET base pitch. Simultaneous events make
+By default, NoteOn attacks immediately at Scala/12-TET base pitch. Simultaneous events make
 one optimizer request; the worker can improve tuning shortly afterwards through
-glide, without retriggering. There is **no declared latency and no delayed NoteOn
+glide, without retriggering. In this mode there is **no declared latency and no delayed NoteOn
 queue**. The initial fast path keeps existing targets and assigns base pitches
 to new voices; it is not an additional approximate beam search.
 
+The editor's **Note attack / Атака ноты** selector also offers
+**Сначала подобрать строй (ждать JI)** (`attack_mode: "tuned"`). In this mode,
+new voices reserve their channels but remain silent until a valid optimizer
+result arrives. They receive their final target Pitch Bend **before NoteOn**,
+without an initial base-pitch attack or attack glide. Already sounding voices
+still glide to updated targets normally. Select the mode, then **Validate and
+apply**; the setting is saved in the project. Old projects without this field
+retain `immediate` behavior.
+
+Waiting mode restores the *tuned attack* policy, not synchronous audio-thread
+search: it deliberately introduces variable attack delay (search/queue time,
+plus up to a processing block). It does not declare a fixed host latency or
+time-shift later NoteOffs. Short notes released before the result arrives are
+cancelled unless sustained. Pending sustained voices attack at the solved pitch
+then receive NoteOff under the pedal; pedal-up/reset cancels those still pending.
+Continuous changes can keep superseding a slow search and postpone attacks.
+Standalone is unchanged. Batching/asynchronous result timing means this is not
+a promise of bit-identical output to the old sequential standalone performance.
+
 Offline rendering runs the full solver synchronously once per sample-offset
 batch. It is deterministic across block sizes, but is not an exact replay of
-the wall-clock worker completion times heard during realtime playback.
+the wall-clock worker completion times heard during realtime playback. In tuned
+attack mode, offline NoteOn starts at the input sample with the solved pitch.
 
 ## Editor and project state
 
@@ -52,6 +72,17 @@ Open the custom editor. Expand configuration groups, edit values, then press
 configuration at a processing-block boundary. Parameters are deliberately
 non-automatable configuration; the host's configuration-revision parameter
 marks editor changes, not a musical automation lane.
+
+The **Live notes / Звучащие ноты** panel uses 22 px rows and shows input note,
+voice ID, held/pedal/waiting status, chosen rational relation, current interpolated
+and target cents, mapped output note and MPE channel. Ratios refer to the displayed
+reference of the last accepted solution; that reference is not necessarily a
+tonic. An em dash means no solution/current sounding pitch yet. During a search,
+the last accepted targets remain displayed with an updating indicator. Cents
+include Scala's base displacement relative to the *input* MIDI note's 12-TET
+pitch, not just the smaller bend around its remapped output note. Live data is
+not saved in project state. Fixed-size lock-free snapshots keep formatting and
+painting entirely outside the audio callback.
 
 The editor exposes:
 
@@ -89,8 +120,9 @@ longer provide this plugin an output-event callback.
 
 See [the realtime audit](plugin-readiness.md) for measured callback/worker times,
 allocation boundaries, overload limits and the costly 128-partial stress case.
-Large searches stay on the worker; they can take hundreds of milliseconds without
-delaying the attack, but their refinement may be too late to be useful.
+Large searches stay on the worker; they can take hundreds of milliseconds. In
+immediate mode this delays refinement, not attack. In tuned attack mode this
+also delays new NoteOns; use the default immediate mode for latency-sensitive playing.
 
 ```sh
 cargo fmt --all --check

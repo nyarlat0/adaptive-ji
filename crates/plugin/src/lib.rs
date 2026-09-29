@@ -2,7 +2,7 @@
 mod editor;
 #[cfg(test)]
 mod tests;
-use adaptive_ji_core::{event::MidiEvent, settings::EngineSettings};
+use adaptive_ji_core::{event::MidiEvent, realtime::LiveSnapshot, settings::EngineSettings};
 use adaptive_ji_runtime::session::Session;
 use crossbeam_queue::ArrayQueue;
 use logic_nih_plug::prelude::*;
@@ -29,7 +29,7 @@ impl Default for Parameters {
     fn default() -> Self {
         Self {
             settings: Arc::new(Mutex::new(EngineSettings::default())),
-            editor: EguiState::from_size(760, 760),
+            editor: EguiState::from_size(1020, 900),
             revision: IntParam::new(
                 "Configuration revision",
                 0,
@@ -49,7 +49,8 @@ struct Control {
     busy: AtomicBool,
     panic: AtomicBool,
     sample_rate: AtomicU32,
-    message: Mutex<String>, // GUI/background only, never process()
+    message: Mutex<String>,         // GUI/background only, never process()
+    live: ArrayQueue<LiveSnapshot>, // fixed-size copy packets, no GUI locks on RT
 }
 impl Default for Control {
     fn default() -> Self {
@@ -60,6 +61,7 @@ impl Default for Control {
             panic: AtomicBool::new(false),
             sample_rate: AtomicU32::new(48000.0f32.to_bits()),
             message: Mutex::new(String::new()),
+            live: ArrayQueue::new(2),
         }
     }
 }
@@ -224,6 +226,10 @@ impl Plugin for AdaptiveJiPlugin {
         while self.control.retired.pop().is_some() {}
         self.control.busy.store(false, Ordering::Release);
         let settings = self.params.settings.lock().unwrap().clone();
+        self.control.live.force_push(LiveSnapshot {
+            attack_mode: settings.attack_mode,
+            ..LiveSnapshot::default()
+        });
         match Session::new(&settings, f64::from(config.sample_rate)) {
             Ok(session) => {
                 self.active = Some(Box::new(PreparedSession {
@@ -245,9 +251,11 @@ impl Plugin for AdaptiveJiPlugin {
     }
     fn reset(&mut self) {
         self.reset_pending = true;
+        self.control.live.force_push(LiveSnapshot::default());
     }
     fn deactivate(&mut self) {
         self.reset_pending = true;
+        self.control.live.force_push(LiveSnapshot::default());
     }
     fn process(
         &mut self,
@@ -316,6 +324,12 @@ impl Plugin for AdaptiveJiPlugin {
             active
                 .session
                 .process(start, frames, self.offline, events, emit);
+            self.control.live.force_push(
+                active
+                    .session
+                    .core
+                    .live_snapshot(start + u64::from(frames) - 1),
+            );
         }
         self.cursor += u64::from(frames);
         ProcessStatus::Normal

@@ -214,3 +214,131 @@ fn format_frontend_and_portable_session_emit_identical_offline_mpe() {
     );
     assert_eq!(host.output, expected);
 }
+
+#[test]
+fn tuned_plugin_attacks_at_solved_bends_and_publishes_readable_live_data() {
+    use adaptive_ji_core::{pitch_bend::cents_to_pitch_bend, settings::AttackMode};
+    let settings = EngineSettings {
+        attack_mode: AttackMode::Tuned,
+        ..EngineSettings::default()
+    };
+    let mut plugin = AdaptiveJiPlugin {
+        active: Some(Box::new(PreparedSession {
+            rate: 48000.0f32.to_bits(),
+            session: Session::new(&settings, 48000.0).unwrap(),
+        })),
+        offline: true,
+        ..AdaptiveJiPlugin::default()
+    };
+    let mut host = Host {
+        transport: Transport::new(48000.0),
+        input: [60, 64, 67]
+            .into_iter()
+            .map(|n| output(19, [0x90, n, 100]))
+            .collect(),
+        output: Vec::with_capacity(1024),
+    };
+    let mut buffer = Buffer::default();
+    unsafe {
+        buffer.set_slices(2048, |_| {});
+    }
+    plugin.process(
+        &mut buffer,
+        &mut AuxiliaryBuffers {
+            inputs: &mut [],
+            outputs: &mut [],
+        },
+        &mut host,
+    );
+    let snapshot = plugin.control.live.pop().unwrap();
+    assert_eq!(snapshot.attack_mode, AttackMode::Tuned);
+    assert!(!snapshot.optimizing);
+    assert_eq!(snapshot.voices.iter().flatten().count(), 3);
+    for voice in snapshot.voices.iter().flatten() {
+        let target = voice.target.unwrap();
+        assert!(!voice.pending);
+        assert_eq!(voice.current_cents, Some(target.cents_offset));
+        let on=host.output.iter().position(|e| matches!(e, NoteEvent::NoteOn {timing:19,channel,note,..} if *channel==voice.output_channel && *note==voice.output_note)).unwrap();
+        let bend = host.output[..on]
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                NoteEvent::MidiPitchBend {
+                    timing: 19,
+                    channel,
+                    value,
+                } if *channel == voice.output_channel => Some((value * 16383.0).round() as u16),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(bend, cents_to_pitch_bend(target.cents_offset, 2.0));
+    }
+    // No attack glide ticks during the remainder of this long block.
+    assert!(
+        host.output
+            .iter()
+            .all(|e| !matches!(e,NoteEvent::MidiPitchBend {timing,..} if *timing>19))
+    );
+    plugin.deactivate();
+    assert!(
+        plugin
+            .control
+            .live
+            .pop()
+            .unwrap()
+            .voices
+            .iter()
+            .all(Option::is_none)
+    );
+}
+
+#[test]
+fn tuned_realtime_plugin_pending_notes_and_telemetry_allocate_nothing() {
+    let settings = EngineSettings {
+        attack_mode: adaptive_ji_core::settings::AttackMode::Tuned,
+        ..EngineSettings::default()
+    };
+    let mut plugin = AdaptiveJiPlugin {
+        active: Some(Box::new(PreparedSession {
+            rate: 48000.0f32.to_bits(),
+            session: Session::new(&settings, 48000.0).unwrap(),
+        })),
+        ..AdaptiveJiPlugin::default()
+    };
+    let mut host = Host {
+        transport: Transport::new(48000.0),
+        input: (48..63).map(|n| output(19, [0x90, n, 100])).collect(),
+        output: Vec::with_capacity(1024),
+    };
+    let mut buffer = Buffer::default();
+    unsafe {
+        buffer.set_slices(64, |_| {});
+    }
+    COUNT.with(|c| c.set(Some(0)));
+    plugin.process(
+        &mut buffer,
+        &mut AuxiliaryBuffers {
+            inputs: &mut [],
+            outputs: &mut [],
+        },
+        &mut host,
+    );
+    let count = COUNT.with(|c| c.replace(None).unwrap());
+    assert_eq!(count, 0);
+    assert!(
+        !host
+            .output
+            .iter()
+            .any(|e| matches!(e, NoteEvent::NoteOn { .. }))
+    );
+    let snapshot = plugin.control.live.pop().unwrap();
+    assert_eq!(
+        snapshot
+            .voices
+            .iter()
+            .flatten()
+            .filter(|v| v.pending && v.current_cents.is_none())
+            .count(),
+        15
+    );
+}

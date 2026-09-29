@@ -33,6 +33,8 @@ pub struct MpeProcessor<T> {
     glide: GlideEngine,
     tuned_scratch: Vec<TunedNote>,
     diagnostics: bool,
+    defer_attacks: bool,
+    pending_attacks: [u64; 15],
 }
 
 impl<T: TuningStrategy> MpeProcessor<T> {
@@ -57,6 +59,8 @@ impl<T: TuningStrategy> MpeProcessor<T> {
             glide: GlideEngine::new(glide_config, bend_range.semitones()),
             tuned_scratch: Vec::with_capacity(15),
             diagnostics: true,
+            defer_attacks: false,
+            pending_attacks: [0; 15],
         }
     }
 
@@ -72,6 +76,48 @@ impl<T: TuningStrategy> MpeProcessor<T> {
     }
     pub fn strategy_mut(&mut self) -> &mut T {
         &mut self.tuning
+    }
+
+    /// Configure only while empty. Standalone retains its synchronous path.
+    pub fn defer_attacks(&mut self, enabled: bool) {
+        assert!(self.voices().is_empty());
+        self.defer_attacks = enabled;
+    }
+
+    pub fn is_pending(&self, id: u64) -> bool {
+        self.pending_attacks.contains(&id)
+    }
+
+    fn forget_pending(&mut self, id: u64) {
+        for slot in &mut self.pending_attacks {
+            if *slot == id {
+                *slot = 0;
+            }
+        }
+    }
+
+    /// Called only after accepting a complete, current-generation solution.
+    /// No pending voice has glide state, so retune emits its target immediately.
+    pub fn start_pending_to(&mut self, now: Duration, mut send: impl FnMut(MidiMessage)) {
+        let pending = self.pending_attacks;
+        for voice in self.voices().iter().filter(|v| pending.contains(&v.id)) {
+            for message in self.bend_range.rpn(voice.output_channel) {
+                send(message);
+            }
+        }
+        self.pending_attacks.fill(0);
+        self.retune_to(now, &mut send);
+        for voice in self.voices().iter().filter(|v| pending.contains(&v.id)) {
+            send([
+                0x90 | voice.output_channel,
+                voice.output_note,
+                voice.velocity,
+            ]);
+            // Key released while waiting, but the pedal still holds this voice.
+            if voice.state == VoiceState::ReleasedSustained {
+                send([0x80 | voice.output_channel, voice.output_note, 0]);
+            }
+        }
     }
 
     pub fn snapshot(&self, now: Duration, output: &mut [ActiveNote; 15]) -> usize {
@@ -162,6 +208,14 @@ impl<T: TuningStrategy> MpeProcessor<T> {
                     );
                     return Ok(());
                 };
+                if self.defer_attacks {
+                    *self
+                        .pending_attacks
+                        .iter_mut()
+                        .find(|id| **id == 0)
+                        .unwrap() = voice.id;
+                    return Ok(());
+                }
                 diagnostic!(
                     self,
                     info,
@@ -231,7 +285,9 @@ impl<T: TuningStrategy> MpeProcessor<T> {
             );
             return Ok(());
         };
-        send(&[0x80 | voice.output_channel, voice.output_note, velocity])?;
+        if !self.is_pending(voice.id) {
+            send(&[0x80 | voice.output_channel, voice.output_note, velocity])?;
+        }
         let sustained = self.sustain_down;
         self.allocator.release_key(channel, note, sustained);
         diagnostic!(
@@ -244,6 +300,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
             if sustained { " sustained" } else { "" }
         );
         if !sustained {
+            self.forget_pending(voice.id);
             self.glide.remove(voice.id);
             send(&encode_pitch_bend(voice.output_channel, CENTER))?;
             let mut output = EventBuffer::new();
@@ -332,6 +389,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
         self.sustain_down = false;
         self.allocator.remove_sustained();
         for voice in released.iter().flatten() {
+            self.forget_pending(voice.id);
             self.glide.remove(voice.id);
             diagnostic!(
                 self,
@@ -367,6 +425,9 @@ impl<T: TuningStrategy> MpeProcessor<T> {
         self.tuning
             .tune_into(&notes[..len], &mut self.tuned_scratch);
         for tuned in &self.tuned_scratch {
+            if self.pending_attacks.contains(&tuned.id) {
+                continue;
+            }
             if let Some(voice) = self.allocator.voice_mut(tuned.id) {
                 voice.cents_offset = tuned.cents_offset;
                 let output_cents = tuned.cents_offset
@@ -548,6 +609,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
             return Err(error);
         }
         self.allocator.clear();
+        self.pending_attacks.fill(0);
         self.sustain_down = false;
         self.tuning.tune_into(&[], &mut self.tuned_scratch);
         diagnostic!(

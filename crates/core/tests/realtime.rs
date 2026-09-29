@@ -1,7 +1,8 @@
 use adaptive_ji_core::{
     event::MidiEvent,
     realtime::{RealtimeCore, RetuneResult},
-    settings::{EmbeddedScale, EngineSettings},
+    settings::{AttackMode, EmbeddedScale, EngineSettings},
+    tuning::{Ratio, TunedNote},
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -211,4 +212,229 @@ fn embedded_non_octave_scala_roundtrip_needs_no_files() {
     let restored: EngineSettings =
         serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
     assert_eq!(render(64, &settings), render(512, &restored));
+}
+
+fn tuned_core() -> RealtimeCore {
+    let settings = EngineSettings {
+        attack_mode: AttackMode::Tuned,
+        ..EngineSettings::default()
+    };
+    RealtimeCore::new(&settings.prepare().unwrap(), 48000.0, true).unwrap()
+}
+
+#[test]
+fn tuned_attack_waits_for_valid_solution_and_starts_at_target_without_glide() {
+    let mut core = tuned_core();
+    core.begin_batch();
+    core.event(10, on(64), |_, _| panic!("premature attack"));
+    let request = core.finish_batch(10).unwrap();
+    let pending = core.live_snapshot(11).voices[0].unwrap();
+    assert!(pending.pending);
+    assert!(pending.current_cents.is_none());
+    assert!(pending.target.is_none());
+    // A second event before the first calculation completes replaces that request.
+    core.begin_batch();
+    core.event(12, on(67), |_, _| panic!("premature attack"));
+    let current = core.finish_batch(12).unwrap();
+    assert!(
+        current.notes[..2]
+            .iter()
+            .all(|n| n.current_offset_cents.is_none())
+    );
+    let targets = [
+        TunedNote {
+            id: current.notes[0].id,
+            ratio: Ratio::ONE,
+            cents_offset: -13.686,
+        },
+        TunedNote {
+            id: current.notes[1].id,
+            ratio: Ratio::new(6, 5).unwrap(),
+            cents_offset: 1.955,
+        },
+    ];
+    assert!(!core.apply_result(
+        15,
+        RetuneResult::from_targets(request, &targets[..1]),
+        |_, _| panic!("stale attack")
+    ));
+    let mut output = Vec::new();
+    assert!(
+        core.apply_result(20, RetuneResult::from_targets(current, &targets), |s, m| {
+            output.push((s, m))
+        })
+    );
+    for (voice, target) in core.voices().iter().zip(targets) {
+        let bend = adaptive_ji_core::pitch_bend::encode_pitch_bend(
+            voice.output_channel,
+            adaptive_ji_core::pitch_bend::cents_to_pitch_bend(target.cents_offset, 2.0),
+        );
+        let bend_index = output.iter().position(|(_, m)| *m == bend).unwrap();
+        let on_index = output
+            .iter()
+            .position(|(_, m)| *m == [0x90 | voice.output_channel, voice.output_note, 100])
+            .unwrap();
+        assert!(bend_index < on_index);
+    }
+    assert!(output.iter().all(|(s, _)| *s == 20));
+    core.advance_before(5000, |_, _| panic!("new voice should not glide"));
+    let snapshot = core.live_snapshot(21);
+    assert!(!snapshot.optimizing);
+    assert_eq!(snapshot.reference, Some((targets[0].id, 64)));
+    for (voice, target) in snapshot.voices.iter().flatten().zip(targets) {
+        assert!(!voice.pending);
+        assert_eq!(voice.target, Some(target));
+        assert_eq!(voice.current_cents, Some(target.cents_offset));
+    }
+}
+
+#[test]
+fn pending_note_off_and_channel_reuse_cannot_trigger_old_attacks() {
+    let mut core = tuned_core();
+    core.begin_batch();
+    core.event(0, on(60), |_, _| {});
+    let old = core.finish_batch(0).unwrap();
+    let channel = core.voices()[0].output_channel;
+    core.begin_batch();
+    core.event(1, off(60), |_, m| assert_ne!(m[0] & 0xf0, 0x90));
+    core.event(1, on(62), |_, _| {});
+    let new = core.finish_batch(1).unwrap();
+    assert_eq!(core.voices()[0].output_channel, channel);
+    let mut target = TunedNote {
+        id: old.notes[0].id,
+        ratio: Ratio::ONE,
+        cents_offset: 10.0,
+    };
+    assert!(!core.apply_result(
+        2,
+        RetuneResult::from_targets(old, &[target]),
+        |_, _| panic!()
+    ));
+    target.id = new.notes[0].id;
+    let mut ons = Vec::new();
+    assert!(
+        core.apply_result(3, RetuneResult::from_targets(new, &[target]), |_, m| {
+            if m[0] & 0xf0 == 0x90 {
+                ons.push(m);
+            }
+        })
+    );
+    assert_eq!(ons, vec![[0x90 | channel, 62, 100]]);
+    for controller in [120, 123] {
+        core.begin_batch();
+        core.event(4, on(67), |_, _| {});
+        let request = core.finish_batch(4).unwrap();
+        core.begin_batch();
+        core.event(5, cc(controller, 0), |_, _| {});
+        core.finish_batch(5);
+        assert!(!core.apply_result(6, RetuneResult::from_targets(request, &[]), |_, _| panic!()));
+        assert!(core.live_snapshot(6).voices.iter().all(Option::is_none));
+    }
+    core.reset(7, |_, _| {});
+    core.advance_before(10000, |_, _| panic!());
+}
+
+#[test]
+fn pending_repeated_notes_under_sustain_attack_separately_and_release_safely() {
+    let mut core = tuned_core();
+    core.begin_batch();
+    for event in [cc(64, 127), on(60), off(60), on(60), off(60), on(64)] {
+        core.event(0, event, |_, m| assert_ne!(m[0] & 0xf0, 0x90));
+    }
+    let request = core.finish_batch(0).unwrap();
+    assert_eq!(request.len, 3);
+    let targets: Vec<_> = request.notes[..3]
+        .iter()
+        .map(|n| TunedNote {
+            id: n.id,
+            ratio: Ratio::ONE,
+            cents_offset: 3.0,
+        })
+        .collect();
+    let mut output = Vec::new();
+    assert!(
+        core.apply_result(10, RetuneResult::from_targets(request, &targets), |_, m| {
+            output.push(m)
+        })
+    );
+    for voice in core.voices().iter().filter(|v| v.input_note == 60) {
+        let on = output
+            .iter()
+            .position(|m| *m == [0x90 | voice.output_channel, 60, 100])
+            .unwrap();
+        let off = output
+            .iter()
+            .position(|m| *m == [0x80 | voice.output_channel, 60, 0])
+            .unwrap();
+        assert!(on < off);
+    }
+    assert_eq!(
+        core.live_snapshot(10)
+            .voices
+            .iter()
+            .flatten()
+            .filter(|v| v.state == adaptive_ji_core::voice::VoiceState::ReleasedSustained)
+            .count(),
+        2
+    );
+    core.begin_batch();
+    core.event(20, cc(64, 0), |_, _| {});
+    core.finish_batch(20);
+    assert_eq!(core.voices().len(), 1);
+    assert_eq!(core.voices()[0].input_note, 64);
+
+    // Pedal-up before optimization cancels pending sustained voices entirely.
+    core.reset(21, |_, _| {});
+    core.begin_batch();
+    for event in [cc(64, 127), on(60), off(60)] {
+        core.event(22, event, |_, _| {});
+    }
+    let stale = core.finish_batch(22).unwrap();
+    core.begin_batch();
+    core.event(23, cc(64, 0), |_, _| {});
+    core.finish_batch(23);
+    assert!(core.voices().is_empty());
+    assert!(!core.apply_result(24, RetuneResult::from_targets(stale, &[]), |_, _| panic!()));
+}
+
+#[test]
+fn delayed_attack_and_live_snapshot_remain_allocation_free_at_fifteen_voices() {
+    let mut core = tuned_core();
+    COUNT.with(|c| c.set(Some(0)));
+    core.begin_batch();
+    for note in 48..63 {
+        core.event(0, on(note), |_, _| {});
+    }
+    let request = core.finish_batch(0).unwrap();
+    let mut result = RetuneResult::from_targets(request, &[]);
+    result.len = 15;
+    for (target, note) in result.targets.iter_mut().zip(request.notes) {
+        target.id = note.id;
+        target.cents_offset = 13.0;
+    }
+    assert!(core.apply_result(10, result, |_, _| {}));
+    let snapshot = core.live_snapshot(10);
+    assert_eq!(snapshot.voices.iter().flatten().count(), 15);
+    core.reset(11, |_, _| {});
+    let count = COUNT.with(|c| c.replace(None).unwrap());
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn old_state_defaults_to_immediate_and_tuned_state_roundtrips() {
+    let mut json = serde_json::to_value(EngineSettings::default()).unwrap();
+    json.as_object_mut().unwrap().remove("attack_mode");
+    let restored: EngineSettings = serde_json::from_value(json).unwrap();
+    assert_eq!(restored.attack_mode, AttackMode::Immediate);
+    let tuned = EngineSettings {
+        attack_mode: AttackMode::Tuned,
+        ..restored
+    };
+    let restored: EngineSettings =
+        serde_json::from_str(&serde_json::to_string(&tuned).unwrap()).unwrap();
+    assert_eq!(restored.attack_mode, AttackMode::Tuned);
+    let expected = render(32, &tuned);
+    for block in [64, 128, 256, 512, 1024] {
+        assert_eq!(render(block, &restored), expected);
+    }
 }

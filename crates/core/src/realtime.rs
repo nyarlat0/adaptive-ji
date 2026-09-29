@@ -2,9 +2,9 @@
 use crate::{
     event::MidiEvent,
     mpe::{MidiMessage, MpeProcessor, PanicKind},
-    settings::{BasePitch, PreparedSettings},
+    settings::{AttackMode, BasePitch, PreparedSettings},
     tuning::{ActiveNote, Ratio, TunedNote, TuningStrategy},
-    voice::Voice,
+    voice::{Voice, VoiceState},
 };
 use std::{convert::Infallible, time::Duration};
 
@@ -18,6 +18,28 @@ pub const EMPTY_TARGET: TunedNote = TunedNote {
     ratio: Ratio::ONE,
     cents_offset: 0.0,
 };
+
+/// Copy-only telemetry, formatted exclusively on the GUI thread. Cents are
+/// relative to the input MIDI note's 12-TET pitch, including Scala base tuning.
+#[derive(Clone, Copy, Debug)]
+pub struct LiveVoice {
+    pub id: u64,
+    pub input_note: u8,
+    pub output_note: u8,
+    pub output_channel: u8,
+    pub state: VoiceState,
+    pub pending: bool,
+    pub current_cents: Option<f64>,
+    pub target: Option<TunedNote>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LiveSnapshot {
+    pub voices: [Option<LiveVoice>; 15],
+    pub reference: Option<(u64, u8)>,
+    pub optimizing: bool,
+    pub attack_mode: AttackMode,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct RetuneRequest {
@@ -98,6 +120,10 @@ pub struct RealtimeCore {
     dirty: bool,
     last_reset: Option<u8>,
     reset_on_empty: bool,
+    solution: [TunedNote; 15],
+    solution_len: usize,
+    solution_reference: Option<(u64, u8)>,
+    attack_mode: AttackMode,
 }
 
 impl RealtimeCore {
@@ -118,6 +144,7 @@ impl RealtimeCore {
         let mut processor = MpeProcessor::with_glide(strategy, prepared.bend_range, prepared.glide);
         processor.set_diagnostics(false);
         processor.use_sample_clock(sample_rate);
+        processor.defer_attacks(prepared.attack_mode == AttackMode::Tuned);
         Ok(Self {
             processor,
             generation: 0,
@@ -127,10 +154,45 @@ impl RealtimeCore {
             dirty: false,
             last_reset: None,
             reset_on_empty,
+            solution: [EMPTY_TARGET; 15],
+            solution_len: 0,
+            solution_reference: None,
+            attack_mode: prepared.attack_mode,
         })
     }
     pub fn voices(&self) -> &[Voice] {
         self.processor.voices()
+    }
+    pub fn live_snapshot(&self, sample: u64) -> LiveSnapshot {
+        let mut snapshot = LiveSnapshot {
+            reference: if self.voices().is_empty() {
+                None
+            } else {
+                self.solution_reference
+            },
+            optimizing: !self.voices().is_empty() && self.accepted != self.generation,
+            attack_mode: self.attack_mode,
+            ..LiveSnapshot::default()
+        };
+        let mut notes = [EMPTY_NOTE; 15];
+        self.processor
+            .snapshot(Duration::from_nanos(sample), &mut notes);
+        for ((slot, voice), note) in snapshot.voices.iter_mut().zip(self.voices()).zip(notes) {
+            *slot = Some(LiveVoice {
+                id: voice.id,
+                input_note: voice.input_note,
+                output_note: voice.output_note,
+                output_channel: voice.output_channel,
+                state: voice.state,
+                pending: self.processor.is_pending(voice.id),
+                current_cents: note.current_offset_cents,
+                target: self.solution[..self.solution_len]
+                    .iter()
+                    .find(|t| t.id == voice.id)
+                    .copied(),
+            });
+        }
+        snapshot
     }
     /// Precompute during non-realtime initialization.
     pub fn initialization_messages(&self) -> Vec<MidiMessage> {
@@ -255,7 +317,10 @@ impl RealtimeCore {
         strategy.targets = result.targets;
         strategy.len = result.len;
         self.processor
-            .retune_to(Duration::from_nanos(sample), |m| emit(sample, m));
+            .start_pending_to(Duration::from_nanos(sample), |m| emit(sample, m));
+        self.solution = result.targets;
+        self.solution_len = result.len;
+        self.solution_reference = self.voices().first().map(|v| (v.id, v.input_note));
         self.accepted = result.generation;
         true
     }
@@ -284,6 +349,8 @@ impl RealtimeCore {
         self.generation = self.generation.wrapping_add(1);
         self.epoch = self.epoch.wrapping_add(1);
         self.dirty = false;
+        self.solution_len = 0;
+        self.solution_reference = None;
         RetuneRequest {
             generation: self.generation,
             epoch: self.epoch,

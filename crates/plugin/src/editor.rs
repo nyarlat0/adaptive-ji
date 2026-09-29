@@ -1,5 +1,9 @@
 use super::*;
 use adaptive_ji_core::settings::EmbeddedScale;
+use adaptive_ji_core::{
+    settings::AttackMode,
+    voice::{VoiceState, note_name},
+};
 use logic_nih_plug_egui::{create_egui_editor, egui};
 
 struct Draft {
@@ -8,6 +12,93 @@ struct Draft {
     kbm: String,
     spectrum: String,
     message: String,
+    live: LiveSnapshot,
+}
+
+fn live_notes(ui: &mut egui::Ui, snapshot: &LiveSnapshot) {
+    ui.heading("Live notes / Звучащие ноты");
+    let sounding = snapshot
+        .voices
+        .iter()
+        .flatten()
+        .filter(|v| !v.pending)
+        .count();
+    let waiting = snapshot
+        .voices
+        .iter()
+        .flatten()
+        .filter(|v| v.pending)
+        .count();
+    ui.label(format!(
+        "Звучат: {sounding}   Ожидают расчёта: {waiting}{}",
+        if snapshot.optimizing {
+            "   ·   Подбирается строй…"
+        } else {
+            ""
+        }
+    ));
+    if let Some((id, note)) = snapshot.reference {
+        ui.label(format!(
+            "Отношения к {} (voice {id}) — опора последнего решения, не обязательно тоника.",
+            note_name(note)
+        ));
+    }
+    ui.label("Текущая / целевая поправка: центы к 12-TET входной ноты, включая Scala.");
+    egui::ScrollArea::both()
+        .id_salt("live-notes")
+        .max_height(400.0)
+        .show(ui, |ui| {
+            egui::Grid::new("voices")
+                .striped(true)
+                .spacing([20.0, 8.0])
+                .show(ui, |ui| {
+                    for title in [
+                        "Нота · ID",
+                        "Состояние",
+                        "Отношение",
+                        "Сейчас → цель",
+                        "Выход",
+                    ] {
+                        ui.label(egui::RichText::new(title).size(19.0).strong());
+                    }
+                    ui.end_row();
+                    for voice in snapshot.voices.iter().flatten() {
+                        let state = if voice.pending {
+                            "Ожидает JI"
+                        } else if voice.state == VoiceState::ReleasedSustained {
+                            "Педаль"
+                        } else {
+                            "Звучит"
+                        };
+                        let ratio = voice
+                            .target
+                            .map_or_else(|| "—".into(), |t| t.ratio.to_string());
+                        let current = voice
+                            .current_cents
+                            .map_or_else(|| "—".into(), |c| format!("{c:+.2}"));
+                        let target = voice
+                            .target
+                            .map_or_else(|| "—".into(), |t| format!("{:+.2}c", t.cents_offset));
+                        for text in [
+                            format!("{} · {}", note_name(voice.input_note), voice.id),
+                            state.into(),
+                            ratio,
+                            format!("{current} → {target}"),
+                            format!(
+                                "{} ch{}",
+                                note_name(voice.output_note),
+                                voice.output_channel + 1
+                            ),
+                        ] {
+                            ui.label(egui::RichText::new(text).monospace().size(22.0));
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    if sounding + waiting == 0 {
+        ui.label(egui::RichText::new("Нет активных нот").size(22.0));
+    }
 }
 fn fields(ui: &mut egui::Ui, value: &mut serde_json::Value) {
     match value {
@@ -59,23 +150,53 @@ pub(super) fn create(
         kbm: String::new(),
         spectrum: String::new(),
         message: String::new(),
+        live: LiveSnapshot::default(),
     };
     create_egui_editor(
         params.editor.clone(),
         draft,
-        |_, _| {},
+        |ctx, _| {
+            let mut style = (*ctx.style()).clone();
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(18.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Button, egui::FontId::proportional(18.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Heading, egui::FontId::proportional(26.0));
+            ctx.set_style(style);
+        },
         move |ctx, setter, draft| {
+            while let Some(snapshot) = control.live.pop() {
+                draft.live = snapshot;
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
             egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("adaptive-ji — MPE note effect");
-            ui.label("Immediate notes · asynchronous adaptive tuning · zero declared latency");
+            ui.label(match draft.live.attack_mode { AttackMode::Immediate => "Активный режим: немедленная атака в базовом строе", AttackMode::Tuned => "Активный режим: атака после подбора JI (переменная задержка)" });
             ui.horizontal(|ui| {
                 if ui.button("PANIC").clicked() { control.panic.store(true,Ordering::Release); }
                 if ui.button("Reload current settings").clicked() { draft.value = serde_json::to_value(&*params.settings.lock().unwrap()).unwrap(); }
             });
-            ui.label("Configuration is non-automatable. Apply releases current notes.");
             egui::ScrollArea::vertical().show(ui, |ui| {
+                live_notes(ui, &draft.live);
+                ui.separator();
+                ui.heading("Note attack / Атака ноты");
+                let mut attack = draft.value["attack_mode"].as_str().unwrap_or("immediate").to_owned();
+                egui::ComboBox::from_id_salt("attack-mode").width(500.0)
+                    .selected_text(if attack == "tuned" { "Сначала подобрать строй (ждать JI)" } else { "Сразу: базовый строй → JI через glide" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut attack, "immediate".into(), "Сразу: базовый строй → JI через glide");
+                        ui.selectable_value(&mut attack, "tuned".into(), "Сначала подобрать строй (ждать JI)");
+                    });
+                draft.value["attack_mode"] = attack.into();
+                ui.label("Ждать JI: target Bend → NoteOn, без glide при атаке. Задержка зависит от расчёта.");
+                ui.label("Короткая нота, отпущенная до расчёта без педали, не прозвучит.");
+                ui.label("Выберите режим и нажмите Validate and apply ниже. Apply снимает текущие ноты.");
                 if let Some(map) = draft.value.as_object_mut() {
-                    for (key,value) in map.iter_mut().filter(|(k,_)| !matches!(k.as_str(),"scale"|"custom_spectrum_toml")) {
+                    for (key,value) in map.iter_mut().filter(|(k,_)| !matches!(k.as_str(),"scale"|"custom_spectrum_toml"|"attack_mode")) {
                         ui.collapsing(key, |ui| fields(ui,value));
                     }
                 }
