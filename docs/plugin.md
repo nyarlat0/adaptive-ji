@@ -100,7 +100,16 @@ The editor exposes:
 Values use the same validations/defaults as standalone. Unsupported values
 produce an editor error instead of replacing the working configuration.
 
-Enter an arbitrary `.scl` path and optional `.kbm` path, then **Import Scala into
+The editor scans `~/.scales/` on creation and offers separate `.scl` and `.kbm`
+dropdowns, sorted by filename (extensions are case-insensitive). Select **Без
+.kbm (маппинг по умолчанию)** for the default mapping. **Обновить список** rescans
+the folder after adding/removing files. Only files directly in this folder are
+listed; subdirectories are not scanned. A missing/unreadable folder leaves empty
+lists and an explanatory message, without changing the loaded project tuning.
+Scanning happens outside audio processing; importing still embeds file contents
+in project state.
+
+Choose files from the lists or enter an arbitrary `.scl` path and optional `.kbm` path, then **Import Scala into
 draft** and **Validate and apply**. With no KBM, edit `root_note` (default 60).
 There is no filename-specific scale logic. **Clear scale / 12-TET base** reverts
 the draft. Import custom spectrum TOML in the same way; **Use built-in spectrum**

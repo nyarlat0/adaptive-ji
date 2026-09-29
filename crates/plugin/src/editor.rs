@@ -1,3 +1,4 @@
+use super::scale_library::ScaleLibrary;
 use super::*;
 use adaptive_ji_core::settings::EmbeddedScale;
 use adaptive_ji_core::{
@@ -13,6 +14,34 @@ struct Draft {
     spectrum: String,
     message: String,
     live: LiveSnapshot,
+    library: ScaleLibrary,
+}
+
+fn scale_picker(
+    ui: &mut egui::Ui,
+    id: &str,
+    files: &[String],
+    path: &mut String,
+    empty_label: &str,
+) {
+    let selected = std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| empty_label.into());
+    egui::ComboBox::from_id_salt(id)
+        .width(440.0)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(path, String::new(), empty_label);
+            for file in files {
+                let label = std::path::Path::new(file)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                ui.selectable_value(path, file.clone(), label)
+                    .on_hover_text(file);
+            }
+        });
 }
 
 fn live_notes(ui: &mut egui::Ui, snapshot: &LiveSnapshot) {
@@ -151,6 +180,7 @@ pub(super) fn create(
         spectrum: String::new(),
         message: String::new(),
         live: LiveSnapshot::default(),
+        library: ScaleLibrary::discover(),
     };
     create_egui_editor(
         params.editor.clone(),
@@ -226,6 +256,20 @@ pub(super) fn create(
                 }
                 ui.separator();
                 ui.label("Scala: filenames are used only for import; contents are embedded in project state.");
+                ui.horizontal(|ui| {
+                    ui.label("Библиотека ~/.scales/");
+                    if ui.button("Обновить список").clicked() { draft.library = ScaleLibrary::discover(); }
+                });
+                ui.label(&draft.library.status);
+                ui.horizontal(|ui| {
+                    ui.label("Скейл .scl");
+                    scale_picker(ui, "library-scl", &draft.library.scales, &mut draft.scl, "Выберите .scl / ручной путь");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Маппинг .kbm");
+                    scale_picker(ui, "library-kbm", &draft.library.mappings, &mut draft.kbm, "Без .kbm (маппинг по умолчанию)");
+                });
+                ui.label("Выберите файлы, затем Import Scala into draft → Validate and apply.");
                 ui.horizontal(|ui| {ui.label(".scl path"); ui.text_edit_singleline(&mut draft.scl);});
                 ui.horizontal(|ui| {ui.label(".kbm path (optional)"); ui.text_edit_singleline(&mut draft.kbm);});
                 if ui.button("Import Scala into draft").clicked() {

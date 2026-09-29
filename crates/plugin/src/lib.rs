@@ -1,5 +1,6 @@
 //! CLAP/VST3 frontend; the engine has no dependency on this crate.
 mod editor;
+mod scale_library;
 #[cfg(test)]
 mod tests;
 use adaptive_ji_core::{event::MidiEvent, realtime::LiveSnapshot, settings::EngineSettings};
