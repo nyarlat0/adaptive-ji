@@ -1,0 +1,18 @@
+[package]
+name = "adaptive-ji-core"
+version = "1.2.0"
+edition = "2024"
+license = "Unlicense"
+
+[features]
+default = []
+cli = ["dep:clap"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+
+[dev-dependencies]
+serde_json = "1"

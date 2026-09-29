@@ -1,0 +1,17 @@
+[package]
+name = "adaptive-ji-plugin"
+version = "1.2.0"
+edition = "2024"
+license = "Unlicense"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adaptive-ji-core = { path = "../core" }
+adaptive-ji-runtime = { path = "../runtime" }
+crossbeam-queue = "0.3"
+serde_json = "1"
+serde = "1"
+logic_nih_plug = { git = "https://github.com/CuteDSP/logic_nih_plug", rev = "adda1f92cd1cdaa0951293ca659c9aeafc9e9ae2" }
+logic_nih_plug_egui = { git = "https://github.com/CuteDSP/logic_nih_plug", rev = "adda1f92cd1cdaa0951293ca659c9aeafc9e9ae2" }

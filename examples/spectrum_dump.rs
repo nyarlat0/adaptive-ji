@@ -13,7 +13,7 @@ fn main() {
         .next()
         .expect("usage: spectrum_dump PRESET | --spectrum-file PATH");
     let profile = if first == "--spectrum-file" {
-        SpectrumProfile::from_toml_file(Path::new(&args.next().expect("missing path")))
+        adaptive_ji::files::load_spectrum(Path::new(&args.next().expect("missing path")))
             .expect("invalid spectrum file")
     } else {
         let preset = SpectrumPreset::from_str(&first, true).expect("unknown spectrum preset");

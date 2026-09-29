@@ -1,11 +1,17 @@
-# adaptive-ji 1.1.0
+# adaptive-ji 1.2.0
 
 CLI-программа для Linux: принимает обычный MIDI 1.0 через `midir`/ALSA,
 подбирает контекстный adaptive just intonation с configurable arbitrary
 prime limit для всего аккорда с учётом
 приближённой roughness между partials выбранного спектра и выдаёт
 MPE-подобный поток через виртуальный ALSA MIDI-порт **Adaptive JI Out**.
-GUI, аудиодвижка, JACK API и плагинов в программе нет.
+Standalone сохранён. Также доступны CLAP/VST3 note-effect плагины с общим core,
+простым редактором настроек и встроенным Scala/state. Аудио они не генерируют.
+Сборка, signal flow и realtime-ограничения: [Plugin guide](docs/plugin.md),
+[realtime audit](docs/plugin-readiness.md).
+
+Собственный код: [The Unlicense](UNLICENSE). Сторонние компоненты сохраняют
+свои лицензии: [THIRD_PARTY.md](THIRD_PARTY.md).
 
 В 1.1 Scala `.scl` с `.kbm` или без него задаёт **базовые высоты клавиш**.
 Поверх них тот же adaptive optimizer продолжает выбирать рациональные отношения

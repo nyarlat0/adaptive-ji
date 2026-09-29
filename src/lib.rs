@@ -1,6 +1,3 @@
-pub mod glide;
+pub mod files;
 pub mod midi;
-pub mod mpe;
-pub mod pitch_bend;
-pub mod tuning;
-pub mod voice;
+pub use adaptive_ji_core::{event, glide, mpe, pitch_bend, tuning, voice};

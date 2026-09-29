@@ -1,0 +1,8 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+license = "Unlicense"
+
+[dependencies]
+logic_nih_plug_xtask = { git = "https://github.com/CuteDSP/logic_nih_plug", rev = "adda1f92cd1cdaa0951293ca659c9aeafc9e9ae2" }

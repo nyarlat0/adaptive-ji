@@ -44,7 +44,7 @@ fn main() {
         ..OptimizerConfig::default()
     };
     let profile = if let Some(path) = &file {
-        SpectrumProfile::from_toml_file(Path::new(path)).expect("invalid spectrum file")
+        adaptive_ji::files::load_spectrum(Path::new(path)).expect("invalid spectrum file")
     } else {
         SpectrumProfile::builtin(preset, config.roughness).unwrap()
     };

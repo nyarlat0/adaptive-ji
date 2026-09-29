@@ -1,0 +1,436 @@
+//! Per-voice linear-in-cents output smoothing. No tuning or MIDI transport lives here.
+
+use std::{collections::BTreeMap, time::Duration};
+
+use crate::{pitch_bend::cents_to_pitch_bend, tuning::VoiceId};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GlideConfig {
+    pub duration_ms: u64,
+    pub tick_ms: u64,
+}
+
+impl Default for GlideConfig {
+    fn default() -> Self {
+        Self {
+            duration_ms: 35,
+            tick_ms: 5,
+        }
+    }
+}
+
+impl GlideConfig {
+    pub fn validate(self) -> Result<(), String> {
+        if self.duration_ms > 2000 {
+            return Err("glide-ms must be in 0..=2000".into());
+        }
+        if !(1..=100).contains(&self.tick_ms) {
+            return Err("glide-tick-ms must be in 1..=100".into());
+        }
+        Ok(())
+    }
+
+    fn duration(self) -> Duration {
+        Duration::from_millis(self.duration_ms)
+    }
+
+    fn tick(self) -> Duration {
+        Duration::from_millis(self.tick_ms)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TargetUpdate {
+    Immediate(u16),
+    Scheduled { from_cents: f64, to_cents: f64 },
+    Unchanged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BendUpdate {
+    pub voice_id: VoiceId,
+    pub bend: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GlideState {
+    start_cents: f64,
+    target_cents: f64,
+    start_at: Duration,
+    next_tick_at: Option<Duration>,
+    last_bend: u16,
+}
+
+impl GlideState {
+    fn current(self, now: Duration, duration: Duration) -> f64 {
+        if duration.is_zero() {
+            return self.target_cents;
+        }
+        let progress = (now.saturating_sub(self.start_at).as_secs_f64() / duration.as_secs_f64())
+            .clamp(0.0, 1.0);
+        self.start_cents + (self.target_cents - self.start_cents) * progress
+    }
+}
+
+/// Monotonic times are supplied by the owner; tests can advance time without sleeping.
+pub struct GlideEngine {
+    config: GlideConfig,
+    range_semitones: f64,
+    duration: Duration,
+    tick_interval: Duration,
+    voices: Vec<(VoiceId, GlideState)>,
+}
+
+impl GlideEngine {
+    pub fn new(config: GlideConfig, range_semitones: f64) -> Self {
+        Self {
+            config,
+            range_semitones,
+            duration: config.duration(),
+            tick_interval: config.tick(),
+            voices: Vec::with_capacity(15),
+        }
+    }
+
+    pub fn config(&self) -> GlideConfig {
+        self.config
+    }
+
+    /// In sample-clock mode one nanosecond is one sample index. This avoids
+    /// accumulating fractional-nanosecond rounding at 44.1/48/etc kHz.
+    pub fn use_sample_clock(&mut self, sample_rate: f64) {
+        self.duration = Duration::from_nanos(
+            (self.config.duration_ms as f64 * sample_rate / 1000.0).round() as u64,
+        );
+        self.tick_interval = Duration::from_nanos(
+            ((self.config.tick_ms as f64 * sample_rate / 1000.0).round() as u64).max(1),
+        );
+    }
+
+    pub fn set_target(&mut self, id: VoiceId, target: f64, now: Duration) -> TargetUpdate {
+        let start = self
+            .voices
+            .iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, state)| state.current(now, self.duration));
+        self.retarget_from(id, start, target, now)
+    }
+
+    /// Retarget from a caller-owned snapshot. This keeps tuning's movement
+    /// reference and the emitted glide start at exactly the same position.
+    pub fn retarget_from(
+        &mut self,
+        id: VoiceId,
+        start: Option<f64>,
+        target: f64,
+        now: Duration,
+    ) -> TargetUpdate {
+        let bend = cents_to_pitch_bend(target, self.range_semitones);
+        let Some((_, state)) = self.voices.iter_mut().find(|(key, _)| *key == id) else {
+            assert!(self.voices.len() < 15, "MPE voice limit");
+            self.voices.push((
+                id,
+                GlideState {
+                    start_cents: target,
+                    target_cents: target,
+                    start_at: now,
+                    next_tick_at: None,
+                    last_bend: bend,
+                },
+            ));
+            return TargetUpdate::Immediate(bend);
+        };
+        if self.config.duration_ms == 0 {
+            state.start_cents = target;
+            state.target_cents = target;
+            state.start_at = now;
+            state.next_tick_at = None;
+            state.last_bend = bend;
+            return TargetUpdate::Immediate(bend);
+        }
+        if state.target_cents == target {
+            return TargetUpdate::Unchanged;
+        }
+        let from_cents = start.unwrap_or_else(|| state.current(now, self.duration));
+        state.start_cents = from_cents;
+        state.target_cents = target;
+        state.start_at = now;
+        if from_cents == target {
+            state.next_tick_at = None;
+            if bend != state.last_bend {
+                state.last_bend = bend;
+                return TargetUpdate::Immediate(bend);
+            }
+            return TargetUpdate::Unchanged;
+        }
+        state.next_tick_at = Some(now + self.tick_interval.min(self.duration));
+        TargetUpdate::Scheduled {
+            from_cents,
+            to_cents: target,
+        }
+    }
+
+    /// Return the interpolated audible position at a supplied monotonic time.
+    pub fn current_offset_at(&self, id: VoiceId, now: Duration) -> Option<f64> {
+        self.voices
+            .iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, state)| state.current(now, self.duration))
+    }
+
+    pub fn snapshot_at<I>(&self, ids: I, now: Duration) -> BTreeMap<VoiceId, f64>
+    where
+        I: IntoIterator<Item = VoiceId>,
+    {
+        ids.into_iter()
+            .filter_map(|id| self.current_offset_at(id, now).map(|offset| (id, offset)))
+            .collect()
+    }
+
+    pub fn remove(&mut self, id: VoiceId) {
+        self.voices.retain(|(key, _)| *key != id);
+    }
+
+    /// Reassert the last sent pitch after CC121 without changing the trajectory
+    /// or confusing duplicate-bend suppression on the next tick.
+    pub fn last_emitted_bend(&self, id: VoiceId) -> Option<u16> {
+        self.voices
+            .iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, state)| state.last_bend)
+    }
+
+    pub fn clear(&mut self) {
+        self.voices.clear();
+    }
+
+    pub fn next_deadline(&self) -> Option<Duration> {
+        self.voices
+            .iter()
+            .filter_map(|(_, state)| state.next_tick_at)
+            .min()
+    }
+
+    /// Only due states are sampled. At completion the exact quantized target is used.
+    pub fn tick(&mut self, now: Duration) -> Vec<BendUpdate> {
+        let mut output = Vec::new();
+        self.tick_to(now, |update| output.push(update));
+        output
+    }
+
+    pub fn tick_to(&mut self, now: Duration, mut output: impl FnMut(BendUpdate)) {
+        for (voice_id, state) in &mut self.voices {
+            if !state.next_tick_at.is_some_and(|deadline| now >= deadline) {
+                continue;
+            }
+            let elapsed = now.saturating_sub(state.start_at);
+            let finished = elapsed >= self.duration;
+            let bend = cents_to_pitch_bend(
+                if finished {
+                    state.target_cents
+                } else {
+                    state.current(now, self.duration)
+                },
+                self.range_semitones,
+            );
+            if bend != state.last_bend {
+                state.last_bend = bend;
+                output(BendUpdate {
+                    voice_id: *voice_id,
+                    bend,
+                });
+            }
+            state.next_tick_at = if finished {
+                None
+            } else {
+                Some((now + self.tick_interval).min(state.start_at + self.duration))
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    #[test]
+    fn interpolation_clamps_at_start_midpoint_end_and_after_end() {
+        let state = GlideState {
+            start_cents: 10.0,
+            target_cents: -10.0,
+            start_at: ms(20),
+            next_tick_at: None,
+            last_bend: 8192,
+        };
+        for (time, expected) in [(0, 10.0), (20, 10.0), (35, 0.0), (50, -10.0), (90, -10.0)] {
+            assert!((state.current(ms(time), ms(30)) - expected).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn retarget_uses_interpolated_position_not_old_target() {
+        let mut engine = GlideEngine::new(
+            GlideConfig {
+                duration_ms: 40,
+                tick_ms: 5,
+            },
+            2.0,
+        );
+        assert!(matches!(
+            engine.set_target(1, 0.0, ms(0)),
+            TargetUpdate::Immediate(_)
+        ));
+        engine.set_target(1, 20.0, ms(0));
+        assert_eq!(
+            engine.set_target(1, -20.0, ms(20)),
+            TargetUpdate::Scheduled {
+                from_cents: 10.0,
+                to_cents: -20.0
+            }
+        );
+        assert!((engine.current_offset_at(1, ms(20)).unwrap() - 10.0).abs() < 1e-9);
+        assert!((engine.current_offset_at(1, ms(40)).unwrap() + 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn current_offset_snapshot_is_explicit_and_deterministic() {
+        let mut engine = GlideEngine::new(
+            GlideConfig {
+                duration_ms: 100,
+                tick_ms: 5,
+            },
+            2.0,
+        );
+        engine.set_target(1, 0.0, ms(0));
+        engine.set_target(1, -20.0, ms(0));
+        assert_eq!(engine.current_offset_at(1, ms(25)), Some(-5.0));
+        let snapshot = engine.snapshot_at([1], ms(25));
+        assert_eq!(snapshot.get(&1), Some(&-5.0));
+    }
+
+    #[test]
+    fn retarget_to_current_position_still_emits_unsent_quantized_bend() {
+        let mut engine = GlideEngine::new(
+            GlideConfig {
+                duration_ms: 40,
+                tick_ms: 20,
+            },
+            2.0,
+        );
+        engine.set_target(1, 0.0, ms(0));
+        engine.set_target(1, 20.0, ms(0));
+        assert_eq!(
+            engine.set_target(1, 5.0, ms(10)),
+            TargetUpdate::Immediate(cents_to_pitch_bend(5.0, 2.0))
+        );
+        assert_eq!(engine.next_deadline(), None);
+    }
+
+    #[test]
+    fn zero_duration_is_immediate_and_short_duration_finishes_before_tick() {
+        let mut instant = GlideEngine::new(
+            GlideConfig {
+                duration_ms: 0,
+                tick_ms: 5,
+            },
+            2.0,
+        );
+        instant.set_target(1, 0.0, ms(0));
+        assert_eq!(
+            instant.set_target(1, 15.0, ms(1)),
+            TargetUpdate::Immediate(cents_to_pitch_bend(15.0, 2.0))
+        );
+        assert_eq!(instant.next_deadline(), None);
+        let mut short = GlideEngine::new(
+            GlideConfig {
+                duration_ms: 2,
+                tick_ms: 5,
+            },
+            2.0,
+        );
+        short.set_target(1, 0.0, ms(0));
+        short.set_target(1, 15.0, ms(0));
+        assert_eq!(short.next_deadline(), Some(ms(2)));
+        assert_eq!(short.tick(ms(2))[0].bend, cents_to_pitch_bend(15.0, 2.0));
+    }
+
+    #[test]
+    fn suppresses_duplicate_bends_but_emits_exact_final_target() {
+        let mut engine = GlideEngine::new(
+            GlideConfig {
+                duration_ms: 20,
+                tick_ms: 1,
+            },
+            2.0,
+        );
+        engine.set_target(1, 0.0, ms(0));
+        engine.set_target(1, 0.02, ms(0));
+        assert!(engine.tick(ms(1)).is_empty());
+        let mut updates = Vec::new();
+        for time in 2..=20 {
+            updates.extend(engine.tick(ms(time)));
+        }
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].bend, cents_to_pitch_bend(0.02, 2.0));
+        assert_eq!(engine.next_deadline(), None);
+    }
+
+    #[test]
+    fn voices_move_independently_and_removed_ids_never_tick() {
+        let mut engine = GlideEngine::new(
+            GlideConfig {
+                duration_ms: 20,
+                tick_ms: 5,
+            },
+            2.0,
+        );
+        engine.set_target(1, 0.0, ms(0));
+        engine.set_target(2, 0.0, ms(0));
+        engine.set_target(1, 20.0, ms(0));
+        engine.set_target(2, -20.0, ms(0));
+        assert_eq!(engine.tick(ms(10)).len(), 2);
+        engine.remove(1);
+        assert_eq!(
+            engine.tick(ms(20)),
+            vec![BendUpdate {
+                voice_id: 2,
+                bend: cents_to_pitch_bend(-20.0, 2.0)
+            }]
+        );
+        engine.clear();
+        assert!(engine.tick(ms(100)).is_empty());
+    }
+
+    #[test]
+    fn config_bounds() {
+        assert!(GlideConfig::default().validate().is_ok());
+        assert!(
+            GlideConfig {
+                duration_ms: 2001,
+                tick_ms: 5
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            GlideConfig {
+                duration_ms: 35,
+                tick_ms: 0
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            GlideConfig {
+                duration_ms: 35,
+                tick_ms: 101
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}

@@ -50,7 +50,7 @@ fn main() {
     };
     let profile = spectrum_file.map_or_else(
         || SpectrumProfile::builtin(preset, config.roughness).unwrap(),
-        |path| SpectrumProfile::from_toml_file(Path::new(&path)).unwrap(),
+        |path| adaptive_ji::files::load_spectrum(Path::new(&path)).unwrap(),
     );
     let model = SpectrumModel::from_profile(profile);
     let mut generator = CandidateGenerator::new(config).unwrap();

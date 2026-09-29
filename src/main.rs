@@ -10,7 +10,7 @@ use adaptive_ji::{
         adaptive::AnchorMode,
         profile::{SpectrumPreset, SpectrumProfile},
         roughness::RoughnessConfig,
-        scala::{KeyboardMapping, ScalaScale, ScalaTuning, parse_root_note},
+        scala::{ScalaTuning, parse_root_note},
     },
 };
 use clap::{Parser, ValueEnum};
@@ -173,7 +173,7 @@ fn main() -> anyhow::Result<()> {
                 "--scale currently requires --strategy adaptive; the five-limit baseline has no Scala-relative search"
             );
         }
-        let scale = ScalaScale::load(path).map_err(anyhow::Error::msg)?;
+        let scale = adaptive_ji::files::load_scale(path).map_err(anyhow::Error::msg)?;
         let mapping_path = if let Some(explicit) = &args.kbm {
             Some(explicit.clone())
         } else if args.no_kbm || args.root_note.is_some() {
@@ -187,7 +187,7 @@ fn main() -> anyhow::Result<()> {
         }
         let mapping = mapping_path
             .as_deref()
-            .map(KeyboardMapping::load)
+            .map(adaptive_ji::files::load_mapping)
             .transpose()
             .map_err(anyhow::Error::msg)?;
         let tuning = ScalaTuning::new(
@@ -274,7 +274,7 @@ fn main() -> anyhow::Result<()> {
             }
         };
         let profile = if let Some(path) = &args.spectrum_file {
-            SpectrumProfile::from_toml_file(path).map_err(anyhow::Error::msg)?
+            adaptive_ji::files::load_spectrum(path).map_err(anyhow::Error::msg)?
         } else {
             SpectrumProfile::builtin(args.spectrum, roughness_config).map_err(anyhow::Error::msg)?
         };

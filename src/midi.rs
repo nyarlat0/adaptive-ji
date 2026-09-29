@@ -30,24 +30,7 @@ pub enum MidiInputSource<'a> {
     Virtual,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MidiEvent {
-    NoteOn {
-        channel: u8,
-        note: u8,
-        velocity: u8,
-    },
-    NoteOff {
-        channel: u8,
-        note: u8,
-        velocity: u8,
-    },
-    ControlChange {
-        channel: u8,
-        controller: u8,
-        value: u8,
-    },
-}
+pub use adaptive_ji_core::event::MidiEvent;
 
 /// midir supplies complete messages, including the status byte (no raw running status).
 pub fn parse_message(message: &[u8]) -> Option<MidiEvent> {

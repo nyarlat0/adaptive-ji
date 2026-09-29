@@ -1,0 +1,9 @@
+[package]
+name = "adaptive-ji-runtime"
+version = "1.2.0"
+edition = "2024"
+license = "Unlicense"
+
+[dependencies]
+adaptive-ji-core = { path = "../core" }
+crossbeam-queue = "0.3"
