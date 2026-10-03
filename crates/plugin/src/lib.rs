@@ -1,13 +1,17 @@
 //! CLAP/VST3 frontend; the engine has no dependency on this crate.
 mod editor;
 mod scale_library;
+mod settings_state;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vst3_state_tests;
 use adaptive_ji_core::{event::MidiEvent, realtime::LiveSnapshot, settings::EngineSettings};
 use adaptive_ji_runtime::session::Session;
 use crossbeam_queue::ArrayQueue;
 use logic_nih_plug::prelude::*;
 use logic_nih_plug_egui::EguiState;
+use settings_state::SettingsState;
 use std::{
     cell::RefCell,
     sync::{
@@ -19,7 +23,7 @@ use std::{
 #[derive(Params)]
 struct Parameters {
     #[persist = "engine"]
-    settings: Arc<Mutex<EngineSettings>>,
+    settings: SettingsState,
     #[persist = "editor"]
     editor: Arc<EguiState>,
     // Non-automatable configuration revision informs the host about GUI edits.
@@ -29,7 +33,7 @@ struct Parameters {
 impl Default for Parameters {
     fn default() -> Self {
         Self {
-            settings: Arc::new(Mutex::new(EngineSettings::default())),
+            settings: SettingsState::default(),
             editor: EguiState::from_size(1020, 900),
             revision: IntParam::new(
                 "Configuration revision",
@@ -40,8 +44,33 @@ impl Default for Parameters {
         }
     }
 }
+
+/// An off-thread preparation request tied to a persisted configuration version.
+pub struct ConfigurationRequest {
+    generation: u64,
+    settings: EngineSettings,
+}
+
+impl Parameters {
+    /// GUI only. Publish BEFORE notifying the host or scheduling preparation so
+    /// an immediate project save always sees the configuration the user applied.
+    fn apply_configuration(
+        &self,
+        draft: serde_json::Value,
+    ) -> Result<ConfigurationRequest, String> {
+        let settings: EngineSettings = serde_json::from_value(draft).map_err(|e| e.to_string())?;
+        settings.prepare()?;
+        let generation = self.settings.replace(settings.clone());
+        Ok(ConfigurationRequest {
+            generation,
+            settings,
+        })
+    }
+}
+
 struct PreparedSession {
     rate: u32,
+    generation: u64,
     session: Session,
 }
 struct Control {
@@ -178,7 +207,7 @@ impl Plugin for AdaptiveJiPlugin {
     const MIDI_OUTPUT: MidiConfig = MidiConfig::MidiCCs;
     const SAMPLE_ACCURATE_AUTOMATION: bool = false;
     type SysExMessage = ();
-    type BackgroundTask = EngineSettings;
+    type BackgroundTask = ConfigurationRequest;
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
     }
@@ -188,23 +217,29 @@ impl Plugin for AdaptiveJiPlugin {
     fn task_executor(&mut self) -> TaskExecutor<Self> {
         let control = self.control.clone();
         let params = self.params.clone();
-        Box::new(move |settings| {
+        Box::new(move |request| {
             while control.retired.pop().is_some() {} // Destroy/join ONLY off RT.
+            if request.generation != params.settings.generation() {
+                return;
+            }
             let rate = control.sample_rate.load(Ordering::Acquire);
-            match Session::new(&settings, f64::from(f32::from_bits(rate))) {
+            let prepared = Session::new(&request.settings, f64::from(f32::from_bits(rate)));
+            if request.generation != params.settings.generation() {
+                return; // A host restore or newer Apply superseded this work.
+            }
+            match prepared {
                 Ok(session) => {
-                    *params.settings.lock().unwrap() = settings;
-                    if control
-                        .ready
-                        .push(Box::new(PreparedSession { rate, session }))
-                        .is_err()
-                    {
-                        *control.message.lock().unwrap() =
-                            "A configuration is already pending".into();
-                        control.busy.store(false, Ordering::Release);
-                    } else {
-                        *control.message.lock().unwrap() = "Prepared; applies at the next processing block (releases active notes)".into();
-                    }
+                    // Replacing an obsolete packet destroys its worker here,
+                    // never on the audio thread. Do not write persistent state
+                    // from this delayed task: it could overwrite a host restore.
+                    control.ready.force_push(Box::new(PreparedSession {
+                        rate,
+                        generation: request.generation,
+                        session,
+                    }));
+                    *control.message.lock().unwrap() =
+                        "Prepared; applies at the next processing block (releases active notes)"
+                            .into();
                 }
                 Err(error) => {
                     *control.message.lock().unwrap() = error;
@@ -226,7 +261,7 @@ impl Plugin for AdaptiveJiPlugin {
         while self.control.ready.pop().is_some() {}
         while self.control.retired.pop().is_some() {}
         self.control.busy.store(false, Ordering::Release);
-        let settings = self.params.settings.lock().unwrap().clone();
+        let (generation, settings) = self.params.settings.snapshot();
         self.control.live.force_push(LiveSnapshot {
             attack_mode: settings.attack_mode,
             ..LiveSnapshot::default()
@@ -235,6 +270,7 @@ impl Plugin for AdaptiveJiPlugin {
             Ok(session) => {
                 self.active = Some(Box::new(PreparedSession {
                     rate: config.sample_rate.to_bits(),
+                    generation,
                     session,
                 }))
             }
@@ -291,10 +327,12 @@ impl Plugin for AdaptiveJiPlugin {
         if !self.control.retired.is_full()
             && let Some(new) = self.control.ready.pop()
         {
-            if let Some(old) = &mut self.active {
-                old.session.reset(start, self.offline, &mut emit);
-            }
-            let old = if new.rate == self.control.sample_rate.load(Ordering::Acquire) {
+            let current = new.rate == self.control.sample_rate.load(Ordering::Acquire)
+                && new.generation == self.params.settings.generation();
+            let old = if current {
+                if let Some(old) = &mut self.active {
+                    old.session.reset(start, self.offline, &mut emit);
+                }
                 self.active.replace(new)
             } else {
                 Some(new)
@@ -303,8 +341,10 @@ impl Plugin for AdaptiveJiPlugin {
                 let result = self.control.retired.push(old);
                 debug_assert!(result.is_ok());
             }
-            self.control.busy.store(false, Ordering::Release);
-            self.reset_pending = true;
+            if current {
+                self.control.busy.store(false, Ordering::Release);
+                self.reset_pending = true;
+            }
         }
         if let Some(active) = &mut self.active {
             if self.reset_pending

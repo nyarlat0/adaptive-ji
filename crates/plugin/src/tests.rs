@@ -29,6 +29,164 @@ unsafe impl GlobalAlloc for Alloc {
 }
 #[global_allocator]
 static ALLOC: Alloc = Alloc;
+
+pub(super) fn changed_settings() -> EngineSettings {
+    use adaptive_ji_core::{
+        settings::{AttackMode, EmbeddedScale},
+        tuning::{PrimeLimit, profile::SpectrumPreset},
+    };
+    let mut settings = EngineSettings {
+        attack_mode: AttackMode::Tuned,
+        bend_range: 4.0,
+        spectrum: SpectrumPreset::Bright,
+        scale: Some(EmbeddedScale {
+            name: "embedded tritave; original file no longer exists".into(),
+            scl: "tritave\n3\n5/4\n3/2\n3/1\n".into(),
+            kbm: Some("3\n0\n127\n60\n60\n261.625565\n3\n0\n1\n2\n".into()),
+            root_note: 60,
+        }),
+        custom_spectrum_toml: Some(
+            "[[partial]]\nratio=1.0\namplitude=1.0\n[[partial]]\nratio=2.01\namplitude=0.3\n"
+                .into(),
+        ),
+        ..EngineSettings::default()
+    };
+    settings.optimizer.prime_limit = PrimeLimit::new(13).unwrap();
+    settings.optimizer.weights.movement = 2.25;
+    settings.optimizer.memory_decay = 0.65;
+    settings.glide.duration_ms = 71;
+    settings
+}
+
+struct InitHost;
+impl InitContext<AdaptiveJiPlugin> for InitHost {
+    fn plugin_api(&self) -> PluginApi {
+        PluginApi::Vst3
+    }
+    fn execute(&self, _: ConfigurationRequest) {
+        panic!("unexpected initialization task");
+    }
+    fn set_latency_samples(&self, samples: u32) {
+        assert_eq!(samples, 0);
+    }
+    fn set_current_voice_capacity(&self, _: u32) {}
+}
+
+fn initialize_offline(plugin: &mut AdaptiveJiPlugin) {
+    assert!(plugin.initialize(
+        &AudioIOLayout::default(),
+        &BufferConfig {
+            sample_rate: 48000.0,
+            min_buffer_size: None,
+            max_buffer_size: 2048,
+            process_mode: ProcessMode::Offline,
+        },
+        &mut InitHost
+    ));
+}
+
+#[test]
+fn apply_is_saved_before_background_work_and_restore_recreates_sound() {
+    let source = AdaptiveJiPlugin::default();
+    let settings = changed_settings();
+    // The task intentionally never runs: saving immediately after Apply must work.
+    let _pending = source
+        .params
+        .apply_configuration(serde_json::to_value(&settings).unwrap())
+        .unwrap();
+    let saved = source.params.serialize_fields();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&saved["engine"]).unwrap(),
+        serde_json::to_value(&settings).unwrap()
+    );
+
+    let mut restored = AdaptiveJiPlugin::default();
+    restored.params.deserialize_fields(&saved);
+    initialize_offline(&mut restored);
+    assert_eq!(
+        restored.params.serialize_fields()["engine"],
+        saved["engine"]
+    );
+    let active = &mut restored.active.as_mut().unwrap().session;
+    assert!(active.core.voices().is_empty());
+    let mut expected = Session::new(&settings, 48000.0).unwrap();
+    let events = [
+        input(output(7, [0x90, 60, 100])).unwrap(),
+        input(output(7, [0x90, 61, 100])).unwrap(),
+    ];
+    let mut actual_events = Vec::new();
+    let mut expected_events = Vec::new();
+    active.process(0, 2048, true, events, |s, m| actual_events.push((s, m)));
+    expected.process(0, 2048, true, events, |s, m| expected_events.push((s, m)));
+    assert_eq!(actual_events, expected_events);
+    // Saving a sounding plugin still contains only settings, not live voices.
+    assert_eq!(
+        restored.params.serialize_fields()["engine"],
+        saved["engine"]
+    );
+}
+
+#[test]
+fn host_restore_cannot_be_overwritten_by_an_old_gui_task_or_prepared_session() {
+    let mut plugin = AdaptiveJiPlugin::default();
+    let executor = plugin.task_executor();
+    let request = plugin
+        .params
+        .apply_configuration(serde_json::to_value(changed_settings()).unwrap())
+        .unwrap();
+    executor(request);
+    let obsolete = plugin.control.ready.pop().unwrap();
+    let stale_task = plugin
+        .params
+        .apply_configuration(serde_json::to_value(changed_settings()).unwrap())
+        .unwrap();
+    let saved_defaults = Parameters::default().serialize_fields();
+    plugin.params.deserialize_fields(&saved_defaults);
+    initialize_offline(&mut plugin);
+    let generation = plugin.active.as_ref().unwrap().generation;
+    executor(stale_task);
+    assert!(plugin.control.ready.is_empty());
+    assert_eq!(
+        plugin.params.serialize_fields()["engine"],
+        saved_defaults["engine"]
+    );
+    assert!(plugin.control.ready.push(obsolete).is_ok());
+    let mut buffer = Buffer::default();
+    unsafe {
+        buffer.set_slices(64, |_| {});
+    }
+    let mut host = Host {
+        transport: Transport::new(48000.0),
+        input: VecDeque::new(),
+        output: Vec::with_capacity(1024),
+    };
+    // Realtime disposal goes to the retirement queue; no worker join on RT.
+    plugin.offline = false;
+    COUNT.with(|c| c.set(Some(0)));
+    plugin.process(
+        &mut buffer,
+        &mut AuxiliaryBuffers {
+            inputs: &mut [],
+            outputs: &mut [],
+        },
+        &mut host,
+    );
+    let allocations = COUNT.with(|c| c.replace(None).unwrap());
+    assert_eq!(allocations, 0);
+    assert_eq!(plugin.active.as_ref().unwrap().generation, generation);
+    assert!(!plugin.control.retired.is_empty());
+}
+
+#[test]
+fn invalid_apply_preserves_saved_settings() {
+    let params = Parameters::default();
+    let before = params.serialize_fields();
+    let mut invalid = serde_json::to_value(changed_settings()).unwrap();
+    invalid["bend_range"] = (-1.0).into();
+    assert!(params.apply_configuration(invalid).is_err());
+    assert_eq!(params.serialize_fields(), before);
+    assert_eq!(params.settings.generation(), 0);
+}
 struct Host {
     transport: Transport,
     input: VecDeque<NoteEvent<()>>,
@@ -38,10 +196,10 @@ impl ProcessContext<AdaptiveJiPlugin> for Host {
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Clap
     }
-    fn execute_background(&self, _: EngineSettings) {
+    fn execute_background(&self, _: ConfigurationRequest) {
         panic!("callback scheduled configuration")
     }
-    fn execute_gui(&self, _: EngineSettings) {
+    fn execute_gui(&self, _: ConfigurationRequest) {
         panic!("callback scheduled GUI")
     }
     fn transport(&self) -> &Transport {
@@ -62,6 +220,7 @@ impl ProcessContext<AdaptiveJiPlugin> for Host {
 fn plugin_callback_allocates_nothing_and_preserves_offsets_and_stop_panic() {
     let mut plugin = AdaptiveJiPlugin {
         active: Some(Box::new(PreparedSession {
+            generation: 0,
             rate: 48000.0f32.to_bits(),
             session: Session::new(&EngineSettings::default(), 48000.0).unwrap(),
         })),
@@ -168,6 +327,7 @@ fn format_frontend_and_portable_session_emit_identical_offline_mpe() {
     let settings = EngineSettings::default();
     let mut plugin = AdaptiveJiPlugin {
         active: Some(Box::new(PreparedSession {
+            generation: 0,
             rate: 48000.0f32.to_bits(),
             session: Session::new(&settings, 48000.0).unwrap(),
         })),
@@ -224,6 +384,7 @@ fn tuned_plugin_attacks_at_solved_bends_and_publishes_readable_live_data() {
     };
     let mut plugin = AdaptiveJiPlugin {
         active: Some(Box::new(PreparedSession {
+            generation: 0,
             rate: 48000.0f32.to_bits(),
             session: Session::new(&settings, 48000.0).unwrap(),
         })),
@@ -300,6 +461,7 @@ fn tuned_realtime_plugin_pending_notes_and_telemetry_allocate_nothing() {
     };
     let mut plugin = AdaptiveJiPlugin {
         active: Some(Box::new(PreparedSession {
+            generation: 0,
             rate: 48000.0f32.to_bits(),
             session: Session::new(&settings, 48000.0).unwrap(),
         })),

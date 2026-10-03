@@ -15,6 +15,42 @@ struct Draft {
     message: String,
     live: LiveSnapshot,
     library: ScaleLibrary,
+    settings_generation: u64,
+}
+
+impl Draft {
+    fn from_settings(settings: &SettingsState) -> Self {
+        let (settings_generation, value) = settings.snapshot();
+        Self {
+            value: serde_json::to_value(value).unwrap(),
+            scl: String::new(),
+            kbm: String::new(),
+            spectrum: String::new(),
+            message: String::new(),
+            live: LiveSnapshot::default(),
+            library: ScaleLibrary::default(),
+            settings_generation,
+        }
+    }
+
+    fn reload(&mut self, settings: &SettingsState) {
+        let (generation, value) = settings.snapshot();
+        self.value = serde_json::to_value(value).unwrap();
+        self.settings_generation = generation;
+        self.scl.clear();
+        self.kbm.clear();
+        self.spectrum.clear();
+        self.message.clear();
+    }
+
+    fn sync_restored_settings(&mut self, settings: &SettingsState) {
+        // The framework creates this editor before loading project state.
+        // Follow host restores, without overwriting un-applied GUI edits on
+        // ordinary repaints (the persisted generation has not changed then).
+        if self.settings_generation != settings.generation() {
+            self.reload(settings);
+        }
+    }
 }
 
 fn scale_picker(
@@ -168,20 +204,14 @@ fn fields(ui: &mut egui::Ui, value: &mut serde_json::Value) {
         }
     }
 }
+
 pub(super) fn create(
     params: Arc<Parameters>,
     control: Arc<Control>,
     executor: AsyncExecutor<AdaptiveJiPlugin>,
 ) -> Option<Box<dyn Editor>> {
-    let draft = Draft {
-        value: serde_json::to_value(&*params.settings.lock().unwrap()).unwrap(),
-        scl: String::new(),
-        kbm: String::new(),
-        spectrum: String::new(),
-        message: String::new(),
-        live: LiveSnapshot::default(),
-        library: ScaleLibrary::discover(),
-    };
+    let mut draft = Draft::from_settings(&params.settings);
+    draft.library = ScaleLibrary::discover();
     create_egui_editor(
         params.editor.clone(),
         draft,
@@ -199,6 +229,7 @@ pub(super) fn create(
             ctx.set_style(style);
         },
         move |ctx, setter, draft| {
+            draft.sync_restored_settings(&params.settings);
             while let Some(snapshot) = control.live.pop() {
                 draft.live = snapshot;
             }
@@ -208,17 +239,18 @@ pub(super) fn create(
             ui.label(match draft.live.attack_mode { AttackMode::Immediate => "Активный режим: немедленная атака в базовом строе", AttackMode::Tuned => "Активный режим: атака после подбора JI (переменная задержка)" });
             ui.horizontal_wrapped(|ui| {
                 if ui.button("PANIC").clicked() { control.panic.store(true,Ordering::Release); }
-                if ui.button("Reload current settings").clicked() { draft.value = serde_json::to_value(&*params.settings.lock().unwrap()).unwrap(); }
+                if ui.button("Reload current settings").clicked() { draft.reload(&params.settings); }
                 let apply = egui::Button::new(egui::RichText::new("Validate and apply").color(egui::Color32::WHITE).strong())
                     .fill(egui::Color32::from_rgb(32, 120, 64));
                 if ui.add_enabled(!control.busy.load(Ordering::Acquire), apply).clicked() {
-                    match serde_json::from_value::<EngineSettings>(draft.value.clone()).and_then(|settings| settings.prepare().map(|_|settings).map_err(serde::de::Error::custom)) {
-                        Ok(settings) => {
+                    match params.apply_configuration(draft.value.clone()) {
+                        Ok(request) => {
+                            draft.settings_generation = request.generation;
                             control.busy.store(true,Ordering::Release);
-                            executor.execute_background(settings);
                             setter.begin_set_parameter(&params.revision);
                             setter.set_parameter(&params.revision, (params.revision.value() + 1) % 1024);
                             setter.end_set_parameter(&params.revision);
+                            executor.execute_background(request);
                             draft.message.clear();
                         }
                         Err(error) => draft.message = error.to_string(),
@@ -295,4 +327,39 @@ pub(super) fn create(
         });
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_created_before_host_restore_follows_restored_state_without_losing_local_edits() {
+        let params = Parameters::default();
+        let mut draft = Draft::from_settings(&params.settings);
+        let source = Parameters::default();
+        source
+            .apply_configuration(serde_json::to_value(crate::tests::changed_settings()).unwrap())
+            .unwrap();
+        let saved = source.serialize_fields();
+        // Actual framework order: editor construction, then host state load.
+        params.deserialize_fields(&saved);
+        draft.sync_restored_settings(&params.settings);
+        assert_eq!(
+            draft.value,
+            serde_json::from_str::<serde_json::Value>(&saved["engine"]).unwrap()
+        );
+        draft.value["bend_range"] = 8.0.into();
+        for _ in 0..3 {
+            draft.sync_restored_settings(&params.settings);
+        }
+        assert_eq!(draft.value["bend_range"], 8.0);
+        // A second load can have identical parameter revision but different data.
+        params.deserialize_fields(&Parameters::default().serialize_fields());
+        draft.sync_restored_settings(&params.settings);
+        assert_eq!(
+            draft.value,
+            serde_json::to_value(EngineSettings::default()).unwrap()
+        );
+    }
 }

@@ -76,6 +76,14 @@ configuration at a processing-block boundary. Parameters are deliberately
 non-automatable configuration; the host's configuration-revision parameter
 marks editor changes, not a musical automation lane.
 
+Apply publishes the validated configuration to project state before notifying
+the host or starting background preparation. Saving immediately after Apply
+therefore includes the new settings even while the audio session is still being
+prepared. The editor automatically refreshes after a host state restore; normal
+repaints preserve unapplied edits. Background configurations made obsolete by
+project/preset loading are discarded and cannot overwrite the restored settings.
+Only applied settings are saved; use Apply before saving draft edits.
+
 The **Live notes / Звучащие ноты** panel uses 22 px rows and shows input note,
 voice ID, held/pedal/waiting status, chosen rational relation, current interpolated
 and target cents, mapped output note and MPE channel. Ratios refer to the displayed
@@ -114,7 +122,8 @@ draft** and **Validate and apply**. With no KBM, edit `root_note` (default 60).
 There is no filename-specific scale logic. **Clear scale / 12-TET base** reverts
 the draft. Import custom spectrum TOML in the same way; **Use built-in spectrum**
 clears it. The current draft scale's name is displayed. **Reload current settings**
-refreshes the editor after a host project-state restore.
+discards local draft edits and reloads the current applied configuration. Project
+state restoration updates the editor automatically.
 
 Scala supplies base pitch geometry, including non-octave periods. The adaptive
 optimizer remains active on top. Scale, KBM and custom spectrum contents—not
