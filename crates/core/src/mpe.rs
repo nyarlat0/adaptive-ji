@@ -21,6 +21,10 @@ pub enum PanicKind {
     AllSoundOff,
     AllNotesOff,
     Shutdown,
+    /// Automatic plugin lifecycle reset. An empty engine needs state reset,
+    /// not an unsolicited All Sound Off next to the first incoming NoteOn.
+    /// Explicit panic/shutdown always broadcasts, even with no known voices.
+    HostReset,
 }
 
 /// MIDI-independent state machine with a fallible output sink for the live
@@ -527,7 +531,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
         output
     }
 
-    /// One output-side panic for CC120, CC123 and shutdown/fatal cleanup.
+    /// Common cleanup for explicit panics and automatic plugin resets.
     /// Try every termination message even if a send fails. Keep voice/FIFO
     /// bookkeeping on failure so another attempt can still address each voice.
     pub fn panic_output<E>(
@@ -540,6 +544,7 @@ impl<T: TuningStrategy> MpeProcessor<T> {
             PanicKind::AllSoundOff => "CC120",
             PanicKind::AllNotesOff => "CC123",
             PanicKind::Shutdown => "shutdown",
+            PanicKind::HostReset => "host-reset",
         };
         diagnostic!(
             self,
@@ -573,18 +578,21 @@ impl<T: TuningStrategy> MpeProcessor<T> {
             // All Notes Off alone does not silence sustain-held notes.
             attempt([0xb0 | channel, 64, 0]);
         }
-        for channel in 0..=15 {
-            attempt([0xb0 | channel, 123, 0]);
-        }
-        if kind != PanicKind::AllSoundOff {
+        let broadcast_kill = kind != PanicKind::HostReset || held + sustained != 0;
+        if broadcast_kill {
             for channel in 0..=15 {
-                attempt([0xb0 | channel, 120, 0]);
+                attempt([0xb0 | channel, 123, 0]);
+            }
+            if kind != PanicKind::AllSoundOff {
+                for channel in 0..=15 {
+                    attempt([0xb0 | channel, 120, 0]);
+                }
             }
         }
         diagnostic!(
             self,
             info,
-            "PANIC broadcast CC64=0 CC123=0 CC120=0 ch=1..16"
+            "PANIC broadcast CC64=0 ch=1..16; CC123/CC120={broadcast_kill}"
         );
         // Do not sweep pitch after a failed termination. Cancel scheduling, but
         // retain mapped identities and pending releases for fatal cleanup/retry.
@@ -668,11 +676,37 @@ mod tests {
     }
 
     #[test]
+    fn empty_host_reset_does_not_send_note_kills_but_resets_pedal_and_bends() {
+        let mut processor = processor();
+        processor.process(pedal(127));
+        let mut messages = Vec::new();
+        processor
+            .panic_output(PanicKind::HostReset, |message| {
+                messages.push(*message);
+                Ok::<_, Infallible>(())
+            })
+            .unwrap();
+        assert!(!processor.sustain_down);
+        assert!(processor.voices().is_empty());
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m[0] & 0xf0 == 0xb0 && matches!(m[1], 120 | 123))
+        );
+        for channel in 1..=15 {
+            assert!(messages.contains(&[0xb0 | channel, 64, 0]));
+            assert!(messages.contains(&encode_pitch_bend(channel, CENTER)));
+        }
+        assert!(processor.next_glide_deadline().is_none());
+    }
+
+    #[test]
     fn panics_explicitly_terminate_all_mapped_held_and_sustained_voices() {
         for kind in [
             PanicKind::AllNotesOff,
             PanicKind::AllSoundOff,
             PanicKind::Shutdown,
+            PanicKind::HostReset,
         ] {
             let mut processor = remapped_processor();
             processor.process(on(50));

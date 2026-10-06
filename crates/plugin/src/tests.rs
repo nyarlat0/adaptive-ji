@@ -192,6 +192,176 @@ struct Host {
     input: VecDeque<NoteEvent<()>>,
     output: Vec<NoteEvent<()>>,
 }
+
+fn process_test_block(plugin: &mut AdaptiveJiPlugin, host: &mut Host, frames: usize) {
+    let mut buffer = Buffer::default();
+    unsafe {
+        buffer.set_slices(frames, |_| {});
+    }
+    COUNT.with(|c| c.set(Some(0)));
+    plugin.process(
+        &mut buffer,
+        &mut AuxiliaryBuffers {
+            inputs: &mut [],
+            outputs: &mut [],
+        },
+        host,
+    );
+    let allocations = COUNT.with(|c| c.replace(None).unwrap());
+    assert_eq!(allocations, 0);
+}
+
+#[test]
+fn immediate_first_note_survives_playing_flag_arriving_one_block_late() {
+    // Test both flag timings, and ordinary host block sizes. No worker sleeps:
+    // the immediate attack and lifetime must not depend on search completion.
+    for frames in [32, 64, 256, 1024] {
+        for initially_playing in [false, true] {
+            let mut plugin = AdaptiveJiPlugin::default();
+            initialize_offline(&mut plugin);
+            // Hosts commonly call reset immediately after initialization.
+            plugin.reset();
+            plugin.offline = false;
+            let mut host = Host {
+                transport: Transport::new(48000.0),
+                input: [output(0, [0x90, 60, 100])].into(),
+                output: Vec::with_capacity(2048),
+            };
+            host.transport.playing = initially_playing;
+            process_test_block(&mut plugin, &mut host, frames);
+            // A fresh session must not accompany its first attack with a
+            // channel-mode kill. Receivers may dispatch those controllers
+            // separately from notes within the same process block.
+            assert!(
+                !host
+                    .output
+                    .iter()
+                    .any(|e| matches!(e, NoteEvent::MidiCC { cc: 120 | 123, .. }))
+            );
+            assert_eq!(
+                host.output
+                    .iter()
+                    .filter(|e| matches!(
+                        e,
+                        NoteEvent::NoteOn {
+                            timing: 0,
+                            note: 60,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+            let on = host
+                .output
+                .iter()
+                .position(|e| matches!(e, NoteEvent::NoteOn { .. }))
+                .unwrap();
+            assert!(matches!(
+                host.output[on - 1],
+                NoteEvent::MidiPitchBend { timing: 0, .. }
+            ));
+            host.output.clear();
+            host.transport.playing = true;
+            process_test_block(&mut plugin, &mut host, frames);
+            assert_eq!(
+                plugin.active.as_ref().unwrap().session.core.voices().len(),
+                1
+            );
+            assert_eq!(
+                plugin
+                    .control
+                    .live
+                    .pop()
+                    .unwrap()
+                    .voices
+                    .iter()
+                    .flatten()
+                    .count(),
+                1
+            );
+            assert!(!host.output.iter().any(|e| matches!(
+                e,
+                NoteEvent::NoteOff { .. }
+                    | NoteEvent::NoteOn { .. }
+                    | NoteEvent::MidiCC { cc: 120 | 123, .. }
+            )));
+
+            // The real NoteOff still terminates the allocated member voice.
+            host.input.push_back(output(7, [0x80, 60, 0]));
+            host.output.clear();
+            process_test_block(&mut plugin, &mut host, frames);
+            assert!(
+                plugin
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .session
+                    .core
+                    .voices()
+                    .is_empty()
+            );
+            assert!(host.output.iter().any(|e| matches!(
+                e,
+                NoteEvent::NoteOff {
+                    timing: 7,
+                    channel: 1,
+                    note: 60,
+                    ..
+                }
+            )));
+        }
+    }
+}
+
+#[test]
+fn coincident_host_reset_and_gui_panic_do_not_kill_next_blocks_first_note() {
+    let mut plugin = AdaptiveJiPlugin::default();
+    initialize_offline(&mut plugin);
+    plugin.offline = false;
+    plugin.control.panic.store(true, Ordering::Release);
+    let mut host = Host {
+        transport: Transport::new(48000.0),
+        input: [output(0, [0x90, 60, 100])].into(),
+        output: Vec::with_capacity(2048),
+    };
+    host.transport.playing = true;
+    process_test_block(&mut plugin, &mut host, 64);
+    assert!(!plugin.control.panic.load(Ordering::Acquire));
+    host.output.clear();
+    process_test_block(&mut plugin, &mut host, 64);
+    assert_eq!(
+        plugin.active.as_ref().unwrap().session.core.voices().len(),
+        1
+    );
+    assert!(
+        !host
+            .output
+            .iter()
+            .any(|e| matches!(e, NoteEvent::NoteOff { .. }))
+    );
+
+    // A later, independent panic must still work (including an empty state).
+    for _ in 0..2 {
+        plugin.control.panic.store(true, Ordering::Release);
+        host.output.clear();
+        process_test_block(&mut plugin, &mut host, 64);
+        assert!(
+            plugin
+                .active
+                .as_ref()
+                .unwrap()
+                .session
+                .core
+                .voices()
+                .is_empty()
+        );
+        assert!(host.output.iter().any(|e| matches!(e,
+            NoteEvent::MidiCC { cc: 120, value, .. } if *value == 0.0
+        )));
+    }
+}
+
 impl ProcessContext<AdaptiveJiPlugin> for Host {
     fn plugin_api(&self) -> PluginApi {
         PluginApi::Clap

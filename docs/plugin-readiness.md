@@ -2,8 +2,10 @@
 
 CLAP and VST3 share `adaptive-ji-runtime::Session` and the same portable core.
 The existing standalone CLI keeps its synchronous event policy and musical
-defaults. The plugin has **zero declared latency**: NoteOn is never held waiting
-for the optimizer. This is not a synthesizer and has no audio ports.
+defaults. The plugin has **zero declared latency**: in default `immediate` mode,
+NoteOn is not held waiting for the optimizer. Opt-in `tuned` attack waits for the
+worker, introducing variable attack delay without moving search into the callback.
+This is not a synthesizer and has no audio ports.
 
 ## Execution boundary
 
@@ -52,8 +54,9 @@ is intentional and measurable; it is not a claim that the beam search became
 suitable for an audio callback.
 
 Offline mode bypasses worker scheduling and solves each batch synchronously,
-using the same objective. It retains the immediate base attack and then applies
-the final solution at that event sample. Sample-based glide deadlines make this
+using the same objective. In immediate mode it retains the base attack and then
+applies the solution at that event sample; tuned mode emits the solved bend
+before NoteOn at the input sample. Sample-based glide deadlines make this
 path identical across tested block sizes 32/64/128/256/512/1024. Realtime refinement
 arrival is opportunistic and therefore not bit-identical to offline output.
 
@@ -103,8 +106,12 @@ silently reduced.
 
 ## Reset, state and format boundaries
 
-Stop/restart, detected sample-position discontinuity, explicit panic and host
-reset invalidate pending work and reuse mapped-output panic. If the host stops
+Stop, detected sample-position discontinuity during playback, explicit panic and
+host reset invalidate pending work and reuse mapped-output cleanup. A rising
+playing flag does not reset notes that the host already delivered. Empty automatic
+host resets omit unsolicited CC120/123 to avoid killing the first same-block
+attack; explicit panics always broadcast, even with empty local state.
+If the host stops
 calling process immediately on deactivate, the format supplies no output sink:
 cleanup is delivered at the next process opportunity. The host must also terminate
 downstream notes when tearing down a graph. A plugin cannot deliver MIDI through

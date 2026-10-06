@@ -4,6 +4,7 @@ mod scale_library;
 mod settings_state;
 #[cfg(test)]
 mod tests;
+mod transport;
 #[cfg(test)]
 mod vst3_state_tests;
 use adaptive_ji_core::{event::MidiEvent, realtime::LiveSnapshot, settings::EngineSettings};
@@ -308,12 +309,8 @@ impl Plugin for AdaptiveJiPlugin {
         let transport = context.transport();
         let position = transport.pos_samples();
         let playing = transport.playing;
-        let discontinuity = self.playing.is_some_and(|old| old != playing)
-            || (playing
-                && self
-                    .expected_position
-                    .zip(position)
-                    .is_some_and(|(a, b)| a != b));
+        let discontinuity =
+            transport::requires_reset(self.playing, self.expected_position, playing, position);
         self.expected_position = position.map(|p| if playing { p + i64::from(frames) } else { p });
         self.playing = Some(playing);
         // RefCell only mediates sequential host next_event/send_event borrows;
@@ -347,11 +344,18 @@ impl Plugin for AdaptiveJiPlugin {
             }
         }
         if let Some(active) = &mut self.active {
-            if self.reset_pending
-                || discontinuity
-                || self.control.panic.swap(false, Ordering::AcqRel)
-            {
-                active.session.reset(start, self.offline, &mut emit);
+            // Consume even when another reset is pending. Short-circuiting this
+            // swap leaves a second panic armed for the next block, which can
+            // kill the very first note accepted after this block's reset.
+            let panic_requested = self.control.panic.swap(false, Ordering::AcqRel);
+            if self.reset_pending || discontinuity || panic_requested {
+                if panic_requested || discontinuity {
+                    active.session.reset(start, self.offline, &mut emit);
+                } else {
+                    active
+                        .session
+                        .reset_for_host(start, self.offline, &mut emit);
+                }
                 self.reset_pending = false;
             }
             let events = std::iter::from_fn(|| {

@@ -133,8 +133,14 @@ are limited to 16 MiB. Held voices, sustain, live glide and phrase memory are no
 serialized. Restoring host state requires stopped processing.
 
 **PANIC** schedules the shared mapped-NoteOff / sustain-off / member-channel panic
-at the next processing opportunity. Stop/restart and detected seek/loop jumps
-also reset. Hosts must release downstream voices on graph teardown when they no
+at the next processing opportunity, including when local state is empty.
+Transport stop and detected seek/loop jumps during playback also panic.
+The transition to playing alone does not kill voices: a host may deliver the
+first note before it reports the playing flag. An automatic host reset of an
+already empty engine resets pedal/bends and transient state without adding
+CC120/CC123 beside the first NoteOn; those channel-mode kills can be dispatched
+separately from notes by a receiver. A host reset with known voices still emits
+mapped NoteOffs and the full panic safety net. Hosts must release downstream voices on graph teardown when they no
 longer provide this plugin an output-event callback.
 
 ## Performance and validation

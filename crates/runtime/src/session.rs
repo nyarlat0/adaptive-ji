@@ -64,6 +64,18 @@ impl Session {
         self.submit(request, offline, emit);
         self.initialize_pending = true;
     }
+    /// Automatic lifecycle cleanup, without sending channel-wide kills when
+    /// the engine is already empty. Explicit Panic uses `reset()` instead.
+    pub fn reset_for_host(
+        &mut self,
+        sample: u64,
+        offline: bool,
+        mut emit: impl FnMut(u64, [u8; 3]),
+    ) {
+        let request = self.core.reset_for_host(sample, &mut emit);
+        self.submit(request, offline, emit);
+        self.initialize_pending = true;
+    }
     /// No allocations/locks/search in realtime mode, including initial notes.
     /// Offline mode deliberately solves synchronously and is deterministic.
     pub fn process(

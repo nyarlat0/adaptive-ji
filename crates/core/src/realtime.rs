@@ -339,9 +339,24 @@ impl RealtimeCore {
         self.processor
             .tick_at_to(Duration::from_nanos(sample), |m| emit(sample, m));
     }
-    pub fn reset(&mut self, sample: u64, mut emit: impl FnMut(u64, MidiMessage)) -> RetuneRequest {
+    pub fn reset(&mut self, sample: u64, emit: impl FnMut(u64, MidiMessage)) -> RetuneRequest {
+        self.reset_with_kind(sample, PanicKind::Shutdown, emit)
+    }
+    pub fn reset_for_host(
+        &mut self,
+        sample: u64,
+        emit: impl FnMut(u64, MidiMessage),
+    ) -> RetuneRequest {
+        self.reset_with_kind(sample, PanicKind::HostReset, emit)
+    }
+    fn reset_with_kind(
+        &mut self,
+        sample: u64,
+        kind: PanicKind,
+        mut emit: impl FnMut(u64, MidiMessage),
+    ) -> RetuneRequest {
         self.processor
-            .panic_output(PanicKind::Shutdown, |message| {
+            .panic_output(kind, |message| {
                 emit(sample, *message);
                 Ok::<_, Infallible>(())
             })
